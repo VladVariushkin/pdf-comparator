@@ -127,6 +127,17 @@ def _normalise_key(k: str) -> str:
     return re.sub(r'[\s:]+$', '', k.strip()).lower()
 
 
+def _cell_key(v: str) -> str:
+    """Order-invariant fingerprint for row-key matching.
+
+    Extracts all alphanumeric tokens, sorts them, and joins them.  This makes
+    matching robust to PDF text-wrap differences where the same cell content
+    is extracted with different internal line breaks across document versions
+    (e.g. 'Bravo (M-Su\\nNATL\\n6a-8a)' ≡ 'Bravo (M-Su 6a-\\nNATL\\n8a)').
+    """
+    return " ".join(sorted(re.findall(r'[a-z0-9]+', v.lower())))
+
+
 def _normalise_fields(raw: dict) -> dict:
     """Return a new dict with normalised keys; last value wins on collision."""
     return {_normalise_key(k): (v.strip() if isinstance(v, str) else str(v))
@@ -290,8 +301,8 @@ def _find_natural_key(
     key_cols: list[str] = []
     for col in ordered_cols:
         key_cols.append(col)
-        keys_a = [tuple(row.get(c, "") for c in key_cols) for row in rows_a]
-        keys_b = [tuple(row.get(c, "") for c in key_cols) for row in rows_b]
+        keys_a = [tuple(_cell_key(row.get(c, "")) for c in key_cols) for row in rows_a]
+        keys_b = [tuple(_cell_key(row.get(c, "")) for c in key_cols) for row in rows_b]
         if len(keys_a) == len(set(keys_a)) and len(keys_b) == len(set(keys_b)):
             return key_cols
     return key_cols
@@ -336,10 +347,13 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
     value_cols = [c for c in all_cols if c not in key_cols]
 
     def _key(row: dict) -> tuple:
-        return tuple(row.get(c, "") for c in key_cols)
+        # Fingerprint-based key: order-invariant alphanumeric tokens per cell.
+        # Handles PDF text-wrap differences where the same cell is extracted
+        # with different internal line breaks across document versions.
+        return tuple(_cell_key(row.get(c, "")) for c in key_cols)
 
-    def _label(k: tuple) -> str:
-        return " · ".join(str(v) for v in k)
+    def _display_label(row: dict) -> str:
+        return " · ".join(re.sub(r'\s+', ' ', row.get(c, "")).strip() for c in key_cols)
 
     idx_a = {_key(r): r for r in rows_a}
     idx_b = {_key(r): r for r in rows_b}
@@ -348,7 +362,7 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
     for k in all_keys:
         row_a = idx_a.get(k)
         row_b = idx_b.get(k)
-        label = _label(k)
+        label = _display_label(row_a or row_b)
         for col in value_cols:
             val_a = row_a.get(col) if row_a is not None else None
             val_b = row_b.get(col) if row_b is not None else None

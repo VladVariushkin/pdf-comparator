@@ -251,7 +251,7 @@ if run_manual or run_bulk:
     outcomes = [None] * n_pairs
 
     with st.spinner(f"Evaluating {n_pairs} pair(s) in parallel…"):
-        with ThreadPoolExecutor(max_workers=n_pairs) as executor:
+        with ThreadPoolExecutor(max_workers=min(n_pairs, 3)) as executor:
             futures = {executor.submit(_evaluate_pair, args): args[0] for args in pair_args}
             for future in as_completed(futures):
                 i, name_a, name_b, result, elapsed, error = future.result()

@@ -1,5 +1,8 @@
+import os
 import pytest
 from services.comparator import compare_tables, _find_natural_key
+
+_BEFORE_PDF = r"C:\Users\Vladyslav_Variushkin\Desktop\UWS_279295_Flowchart_Report_2026-03-20_Before.pdf"
 
 
 def _kv(title, data):
@@ -311,6 +314,94 @@ class TestDuplicateColumnDetection:
         assert not any(w.rule == "duplicate_columns" for w in result.warnings)
 
 
+class TestFieldOrdering:
+    """Fields must appear in the original PDF order, not alphabetically."""
+
+    def test_key_value_preserves_pdf_order(self):
+        # Keys in reverse-alpha order — sorted() would put "Alpha" first.
+        data = {"Zebra": "1", "Alpha": "2", "Mango": "3"}
+        a = [_kv("Plan", data)]
+        b = [_kv("Plan", data)]
+        result = compare_tables(a, b)
+        keys = [d.field.split(" › ", 1)[1] for d in result.diffs]
+        assert keys == ["Zebra", "Alpha", "Mango"]
+
+    def test_key_value_b_only_keys_appended_after_a_order(self):
+        a = [_kv("Plan", {"Zebra": "1", "Alpha": "2"})]
+        b = [_kv("Plan", {"Zebra": "1", "Alpha": "2", "Mango": "3"})]
+        result = compare_tables(a, b)
+        keys = [d.field.split(" › ", 1)[1] for d in result.diffs]
+        assert keys == ["Zebra", "Alpha", "Mango"]
+
+    def test_columnar_value_columns_follow_pdf_order(self):
+        # "Rate" before "Days" in PDF — sorted() would put "Days" first.
+        headers = ["Selling Name", "Rate", "Days", "Total"]
+        rows = [{"Selling Name": "Bravo Early", "Rate": "$241", "Days": "MTWTFSS", "Total": "$1,205"}]
+        a = [_col("1Q26", headers, rows)]
+        b = [_col("1Q26", headers, rows)]
+        result = compare_tables(a, b)
+        col_names = [d.field.split(" › ")[-1] for d in result.diffs]
+        assert col_names == ["Rate", "Days", "Total"]
+
+    def test_columnar_rows_follow_pdf_order(self):
+        # "Zebra Early" before "Alpha Morning" in PDF — sorted() would reverse this.
+        headers = ["Name", "Rate"]
+        rows = [
+            {"Name": "Zebra Early", "Rate": "$241"},
+            {"Name": "Alpha Morning", "Rate": "$335"},
+        ]
+        a = [_col("1Q26", headers, rows)]
+        b = [_col("1Q26", headers, rows)]
+        result = compare_tables(a, b)
+        row_labels = [d.field.split(" › ")[1] for d in result.diffs]
+        assert row_labels == ["Zebra Early", "Alpha Morning"]
+
+    def test_matrix_row_labels_follow_pdf_order(self):
+        # ":30" before ":15" in PDF — sorted() would put ":15" first.
+        cols = ["Total"]
+        rows = {":30": {"Total": "$100"}, ":15": {"Total": "$200"}, "Grand": {"Total": "$300"}}
+        a = [_mat("Dollars", cols, rows)]
+        b = [_mat("Dollars", cols, rows)]
+        result = compare_tables(a, b)
+        row_labels = [d.field.split(" › ")[1] for d in result.diffs]
+        assert row_labels == [":30", ":15", "Grand"]
+
+    def test_matrix_columns_follow_pdf_order(self):
+        # "Total" before "1/5" before "12/29" in PDF — sorted() would put "1/5" first.
+        cols = ["Total", "1/5", "12/29"]
+        rows = {":15": {"Total": "$2,545", "1/5": "$0", "12/29": "$0"}}
+        a = [_mat("Dollars", cols, rows)]
+        b = [_mat("Dollars", cols, rows)]
+        result = compare_tables(a, b)
+        col_names = [d.field.split(" › ")[-1] for d in result.diffs]
+        assert col_names == ["Total", "1/5", "12/29"]
+
+    def test_columnar_text_columns_precede_date_columns_per_pdf(self):
+        # Real-world case: PDF has text cols (Days/Times, CommType, …) to the left
+        # of weekly date cols (12/29, 1/5, 1/12 …).  Alphabetically digits sort
+        # before letters, so without the fix 1/12 would appear before CommType.
+        headers = [
+            "Selling Name", "Days/Times", "CommType",
+            "12/29", "1/5", "1/12", "Total Dollars",
+        ]
+        rows = [{
+            "Selling Name": "Bravo Daytime",
+            "Days/Times": "MTWTF 8a-3p",
+            "CommType": "NATL",
+            "12/29": "",
+            "1/5": "",
+            "1/12": "",
+            "Total Dollars": "$5,860",
+        }]
+        a = [_col("1Q26", headers, rows)]
+        b = [_col("1Q26", headers, rows)]
+        result = compare_tables(a, b)
+        col_names = [d.field.split(" › ")[-1] for d in result.diffs]
+        # PDF order: Days/Times, CommType, 12/29, 1/5, 1/12, Total Dollars
+        # (Selling Name is the key col and does not appear as a value field)
+        assert col_names == ["Days/Times", "CommType", "12/29", "1/5", "1/12", "Total Dollars"]
+
+
 class TestFindNaturalKey:
     def test_single_column_when_already_unique(self):
         rows_a = [{"Name": "A", "Rate": "$1"}, {"Name": "B", "Rate": "$2"}]
@@ -334,3 +425,66 @@ class TestFindNaturalKey:
         rows_b2 = [{"Name": "A", "Days": "M"}, {"Name": "A", "Days": "T"}]
         rows_a2 = [{"Name": "A", "Days": "M"}, {"Name": "B", "Days": "W"}]
         assert _find_natural_key(rows_a2, rows_b2, ["Name", "Days"], ["Name", "Days"]) == ["Name", "Days"]
+
+
+# ---------------------------------------------------------------------------
+# Real-PDF regression: 1Q26 table field ordering (page 2)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def before_pdf_tables():
+    """Extract tables from the real Before flowchart PDF; skip if absent."""
+    if not os.path.exists(_BEFORE_PDF):
+        pytest.skip(f"fixture PDF not found: {_BEFORE_PDF}")
+    from services.extractor import _extract_tables
+    return _extract_tables(_BEFORE_PDF)
+
+
+class TestRealPdf1Q26FieldOrdering:
+    """Columns must come out in left-to-right PDF order, not alphabetically.
+
+    The 1Q26 table on page 2 has text columns (Days/Times, CommType, …)
+    to the LEFT of the weekly date columns (12/29, 1/5, 1/12, …).
+    Before the fix, sorted() caused date columns to appear first because
+    digits sort before letters in ASCII.
+    """
+
+    def _1q26_cols(self, before_pdf_tables):
+        result = compare_tables(before_pdf_tables, before_pdf_tables)
+        seen = []
+        for d in result.diffs:
+            if d.table == "1Q26" and d.page == 2:
+                parts = d.field.split("›")
+                if len(parts) >= 3:
+                    col = parts[-1].strip()
+                    if col not in seen:
+                        seen.append(col)
+        return seen
+
+    def test_text_columns_precede_date_columns(self, before_pdf_tables):
+        cols = self._1q26_cols(before_pdf_tables)
+        assert cols, "No columns found for 1Q26 p.2"
+        # Text columns that must appear BEFORE any date column
+        text_before_dates = ["Days/Times", "Comm\nType", "Line\nClass"]
+        first_date_idx = next(
+            (i for i, c in enumerate(cols) if "/" in c and c[0].isdigit()),
+            None,
+        )
+        assert first_date_idx is not None, "No date column found"
+        for col in text_before_dates:
+            idx = next((i for i, c in enumerate(cols) if c == col), None)
+            assert idx is not None, f"Column {col!r} not found"
+            assert idx < first_date_idx, (
+                f"{col!r} at position {idx} should come before first date col at {first_date_idx}"
+            )
+
+    def test_date_columns_in_chronological_order(self, before_pdf_tables):
+        cols = self._1q26_cols(before_pdf_tables)
+        date_cols = [c for c in cols if "/" in c and c[0].isdigit() and c != "Total\nDollars"]
+        # Chronological order as they appear in the PDF: 12/29, 1/5, 1/12, …
+        expected_order = ["12/29", "1/5", "1/12", "1/19", "1/26",
+                          "2/2", "2/9", "2/16", "2/23",
+                          "3/2", "3/9", "3/16", "3/23"]
+        assert date_cols == expected_order, (
+            f"Date cols not in PDF order.\nGot:      {date_cols}\nExpected: {expected_order}"
+        )

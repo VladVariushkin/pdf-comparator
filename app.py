@@ -2,6 +2,7 @@ import io
 import csv
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -12,7 +13,7 @@ load_dotenv()
 from services.extractor import extract_as_text, extract_as_tables
 from services.comparator import compare_structured, compare_freeform, compare_tables
 from services.llm_client import LLMClient
-
+from services.pairer import pair_by_name
 
 
 st.set_page_config(page_title="Doc Compare", layout="wide")
@@ -20,17 +21,55 @@ st.title("Document Comparison")
 
 mode = "Table parser (no AI)"
 
-col_a, col_b = st.columns(2)
-with col_a:
-    files_a = st.file_uploader("Document A", type=["pdf"], accept_multiple_files=True, key="files_a")
-with col_b:
-    files_b = st.file_uploader("Document B", type=["pdf"], accept_multiple_files=True, key="files_b")
+tab_manual, tab_bulk = st.tabs(["Manual", "Bulk"])
 
-if files_a and files_b and len(files_a) != len(files_b):
-    st.warning(f"Unequal number of files: {len(files_a)} in A, {len(files_b)} in B. Pairs are matched by position.")
+with tab_manual:
+    col_a, col_b = st.columns(2)
+    with col_a:
+        files_a = st.file_uploader("Document A", type=["pdf"], accept_multiple_files=True, key="files_a")
+    with col_b:
+        files_b = st.file_uploader("Document B", type=["pdf"], accept_multiple_files=True, key="files_b")
 
-ready = len(files_a) > 0 and len(files_b) > 0
-n_pairs = min(len(files_a), len(files_b))
+    if files_a and files_b and len(files_a) != len(files_b):
+        st.warning(f"Unequal number of files: {len(files_a)} in A, {len(files_b)} in B. Pairs are matched by position.")
+
+    manual_ready = len(files_a) > 0 and len(files_b) > 0
+    manual_n_pairs = min(len(files_a), len(files_b))
+
+with tab_bulk:
+    bulk_files = st.file_uploader(
+        "Upload all PDFs (Before + After)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="bulk_files",
+    )
+    bulk_pairs_detected: list[tuple] = []
+    bulk_unmatched: list[str] = []
+
+    if bulk_files:
+        names = [f.name for f in bulk_files]
+        bulk_pairs_detected, bulk_unmatched = pair_by_name(names)
+
+        if bulk_pairs_detected:
+            st.markdown(f"**{len(bulk_pairs_detected)} pair(s) detected:**")
+            st.dataframe(
+                pd.DataFrame(
+                    [{"#": i + 1, "Document A (Before)": a, "Document B (After)": b}
+                     for i, (a, b) in enumerate(bulk_pairs_detected)]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No pairs detected yet. Upload matching Before/After PDFs.")
+
+        if bulk_unmatched:
+            st.warning(
+                "Could not pair the following files (no matching Before/After counterpart): "
+                + ", ".join(bulk_unmatched)
+            )
+
+    bulk_ready = len(bulk_pairs_detected) > 0
 
 
 def _render_result(result: object, elapsed: float, pair_key: str,
@@ -188,13 +227,26 @@ def _evaluate_pair(args):
     return i, name_a, name_b, result, time.perf_counter() - t0, None
 
 
-if st.button("Compare", disabled=not ready, type="primary"):
-    # Pre-read file bytes in the main thread before handing off to workers
-    pair_args = [
-        (i, files_a[i].name, files_a[i].read(), files_b[i].name, files_b[i].read(), mode)
-        for i in range(n_pairs)
-    ]
+col_btn1, col_btn2 = st.columns(2)
+with col_btn1:
+    run_manual = st.button("Compare", disabled=not manual_ready, type="primary", key="btn_manual")
+with col_btn2:
+    run_bulk = st.button("Compare Pairs", disabled=not bulk_ready, type="primary", key="btn_bulk")
 
+if run_manual or run_bulk:
+    if run_manual:
+        pair_args = [
+            (i, files_a[i].name, files_a[i].read(), files_b[i].name, files_b[i].read(), mode)
+            for i in range(manual_n_pairs)
+        ]
+        n_pairs = manual_n_pairs
+    else:
+        file_map = {f.name: f for f in bulk_files}
+        pair_args = [
+            (i, a, file_map[a].read(), b, file_map[b].read(), mode)
+            for i, (a, b) in enumerate(bulk_pairs_detected)
+        ]
+        n_pairs = len(bulk_pairs_detected)
     total_start = time.perf_counter()
     outcomes = [None] * n_pairs
 
@@ -237,7 +289,7 @@ if st.button("Compare", disabled=not ready, type="primary"):
         excel_placeholder.download_button(
             "⬇ Download Excel Report",
             data=excel_bytes,
-            file_name="comparison_report.xlsx",
+            file_name=f"comparison_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="xlsx_all",
         )

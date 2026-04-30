@@ -262,7 +262,7 @@ def compare_freeform(sections_a: list[str], sections_b: list[str], llm: LLMClien
 
 def _diff_key_value(data_a: dict, data_b: dict, prefix: str, *, table: str = "", page: int = 0) -> list[FieldDiff]:
     diffs = []
-    for key in sorted(set(data_a) | set(data_b)):
+    for key in dict.fromkeys(list(data_a) + list(data_b)):
         val_a = data_a.get(key)
         val_b = data_b.get(key)
         if val_a is None:
@@ -303,7 +303,7 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
     rows_b = tb.get("rows", [])
     headers_a = ta.get("headers", [])
     headers_b = tb.get("headers", [])
-    all_cols = sorted(set(headers_a) | set(headers_b))
+    all_cols = list(dict.fromkeys(headers_a + headers_b))
 
     id_key = (headers_a or headers_b or [None])[0]
 
@@ -344,7 +344,8 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
     idx_a = {_key(r): r for r in rows_a}
     idx_b = {_key(r): r for r in rows_b}
 
-    for k in sorted(set(idx_a) | set(idx_b)):
+    all_keys = list(dict.fromkeys([_key(r) for r in rows_a] + [_key(r) for r in rows_b]))
+    for k in all_keys:
         row_a = idx_a.get(k)
         row_b = idx_b.get(k)
         label = _label(k)
@@ -364,8 +365,8 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
 
 def _diff_matrix(ta: dict, tb: dict, prefix: str, *, table: str = "", page: int = 0) -> list[FieldDiff]:
     diffs = []
-    all_row_labels = sorted(set(ta.get("rows", {})) | set(tb.get("rows", {})))
-    all_cols = sorted(set(ta.get("columns", [])) | set(tb.get("columns", [])))
+    all_row_labels = list(dict.fromkeys(list(ta.get("rows", {})) + list(tb.get("rows", {}))))
+    all_cols = list(dict.fromkeys(ta.get("columns", []) + tb.get("columns", [])))
 
     for row_label in all_row_labels:
         row_a = ta.get("rows", {}).get(row_label, {})

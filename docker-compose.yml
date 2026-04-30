@@ -1,0 +1,11 @@
+services:
+  pdf-comparator:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT}

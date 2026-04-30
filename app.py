@@ -204,7 +204,9 @@ def _render_result(result: object, elapsed: float, pair_key: str,
 
 
 def _evaluate_pair(args):
-    i, name_a, bytes_a, name_b, bytes_b, mode = args
+    i, name_a, file_a, name_b, file_b, mode = args
+    bytes_a = file_a.read()
+    bytes_b = file_b.read()
     t0 = time.perf_counter()
 
     if mode == "Table parser (no AI)":
@@ -236,14 +238,14 @@ with col_btn2:
 if run_manual or run_bulk:
     if run_manual:
         pair_args = [
-            (i, files_a[i].name, files_a[i].read(), files_b[i].name, files_b[i].read(), mode)
+            (i, files_a[i].name, files_a[i], files_b[i].name, files_b[i], mode)
             for i in range(manual_n_pairs)
         ]
         n_pairs = manual_n_pairs
     else:
         file_map = {f.name: f for f in bulk_files}
         pair_args = [
-            (i, a, file_map[a].read(), b, file_map[b].read(), mode)
+            (i, a, file_map[a], b, file_map[b], mode)
             for i, (a, b) in enumerate(bulk_pairs_detected)
         ]
         n_pairs = len(bulk_pairs_detected)

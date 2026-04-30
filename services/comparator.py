@@ -174,9 +174,12 @@ def _values_match(a: str, b: str) -> bool:
 
     # 3. Numeric — handles "$2,400,000 USD" vs "$2,400,000" vs "2400000"
     na, nb = _to_number(a), _to_number(b)
-    if na is not None and nb is not None and na != 0:
-        if abs(na - nb) / abs(na) < 0.001:   # 0.1 % tolerance for rounding
+    if na is not None and nb is not None:
+        if na == 0 and nb == 0:
             return True
+        if na != 0 and abs(na - nb) / abs(na) < 0.001:   # 0.1 % tolerance for rounding
+            return True
+        return False  # both parsed as numbers but differ — skip date check
 
     # 4. Date — handles "January 15, 2025" vs "Jan 15, 2025" vs "2025-01-15"
     da, db = _to_date(a), _to_date(b)

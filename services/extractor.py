@@ -23,25 +23,10 @@ def extract_as_tables(pdf_bytes: bytes) -> list[dict]:
 
 
 def _extract_dfs(path: str):
-    """Yield (page_num, DataFrame) for each table found in the PDF.
-
-    Uses camelot lattice flavor first; falls back to stream when a page
-    yields no tables or low accuracy. Each DataFrame is yielded immediately
-    so camelot's internal image buffers are not accumulated across pages.
-    """
     import camelot
-    import pdfplumber
 
-    with pdfplumber.open(path) as pdf:
-        n_pages = len(pdf.pages)
-
-    for page_num in range(1, n_pages + 1):
-        tables = camelot.read_pdf(path, pages=str(page_num), flavor="lattice")
-        if not tables or tables[0].parsing_report.get("accuracy", 0) < 50:
-            tables = camelot.read_pdf(path, pages=str(page_num), flavor="stream")
-        for table in (tables or []):
-            yield page_num, table.df
-        # tables goes out of scope here; camelot objects (images, DataFrames) are GC'd
+    for table in camelot.read_pdf(path, pages="all", flavor="lattice"):
+        yield table.parsing_report.get("page", 0), table.df
 
 
 def _extract(path: str) -> list[str]:

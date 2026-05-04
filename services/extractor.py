@@ -22,11 +22,76 @@ def extract_as_tables(pdf_bytes: bytes) -> list[dict]:
         os.unlink(tmp_path)
 
 
+def _fix_collapsed_rows(df):
+    """Repair rows where camelot merged all cell data into col_0.
+
+    At page boundaries camelot sometimes collapses an entire row's values into
+    the first cell, separated by newlines.  This detects those rows
+    (non_empty==1, col_0 contains newlines AND at least one numeric/dollar
+    value) and redistributes the split parts back into the correct column
+    positions, using the most common non-empty column pattern from adjacent
+    well-parsed rows as a template.
+    """
+    import re
+    from collections import Counter
+
+    df = df.copy()
+
+    def _has_numeric(s: str) -> bool:
+        s = s.strip()
+        if s.startswith('$'):
+            return True
+        cleaned = re.sub(r'[,\s%]', '', s)
+        if not cleaned:
+            return False
+        try:
+            float(cleaned)
+            return True
+        except ValueError:
+            return False
+
+    pattern_counter: Counter = Counter()
+    for _, row in df.iterrows():
+        cells = [str(c).strip() for c in row]
+        non_empty_idx = tuple(i for i, c in enumerate(cells) if c)
+        if len(non_empty_idx) >= 3:
+            pattern_counter[non_empty_idx] += 1
+
+    if not pattern_counter:
+        return df
+
+    template_indices = pattern_counter.most_common(1)[0][0]
+
+    for idx, row in df.iterrows():
+        cells = [str(c).strip() for c in row]
+        non_empty = [c for c in cells if c]
+        if len(non_empty) != 1:
+            continue
+        col0_val = cells[0]
+        if '\n' not in col0_val:
+            continue
+        parts = [p.strip() for p in col0_val.split('\n') if p.strip()]
+        if len(parts) < 2:
+            continue
+        if not any(_has_numeric(p) for p in parts[1:]):
+            continue
+        if len(parts) != len(template_indices):
+            continue
+        for col_pos, col_idx in enumerate(template_indices):
+            df.iat[idx, col_idx] = parts[col_pos]
+
+    return df
+
+
 def _extract_dfs(path: str):
     import camelot
 
-    for table in camelot.read_pdf(path, pages="all", flavor="lattice"):
-        yield table.parsing_report.get("page", 0), table.df
+    table_list = camelot.read_pdf(path, pages="all", flavor="lattice")
+    try:
+        for table in table_list:
+            yield table.parsing_report.get("page", 0), _fix_collapsed_rows(table.df)
+    finally:
+        del table_list
 
 
 def _extract(path: str) -> list[str]:
@@ -35,10 +100,39 @@ def _extract(path: str) -> list[str]:
 
     sections = []
     with pdfplumber.open(path) as plumber:
-        for page_num in range(1, len(plumber.pages) + 1):
-            tables = camelot.read_pdf(path, pages=str(page_num), flavor="lattice")
-            if not tables or tables[0].parsing_report.get("accuracy", 0) < 50:
-                tables = camelot.read_pdf(path, pages=str(page_num), flavor="stream")
+        n_pages = len(plumber.pages)
+
+        lattice_tables = camelot.read_pdf(path, pages="all", flavor="lattice")
+        lattice_by_page: dict[int, list] = {}
+        for t in lattice_tables:
+            p = t.parsing_report.get("page", 0)
+            lattice_by_page.setdefault(p, []).append(t)
+
+        low_accuracy_pages = sorted(
+            p for p, tables in lattice_by_page.items()
+            if tables[0].parsing_report.get("accuracy", 0) < 50
+        )
+        stream_by_page: dict[int, list] = {}
+        if low_accuracy_pages:
+            stream_tables = camelot.read_pdf(
+                path,
+                pages=",".join(str(p) for p in low_accuracy_pages),
+                flavor="stream",
+            )
+            for t in stream_tables:
+                p = t.parsing_report.get("page", 0)
+                stream_by_page.setdefault(p, []).append(t)
+            del stream_tables
+        del lattice_tables
+
+        for page_num in range(1, n_pages + 1):
+            if page_num in stream_by_page:
+                tables = stream_by_page[page_num]
+            elif page_num in lattice_by_page:
+                tables = lattice_by_page[page_num]
+            else:
+                tables = []
+
             if tables:
                 for table in tables:
                     md = _df_to_markdown(table.df)
@@ -67,8 +161,14 @@ def _merge_tables(base: dict, continuation: dict) -> dict:
     merged = dict(base)
     t = base.get("type")
     if t == "columnar":
+        base_h = base.get("headers", [])
+        cont_h = continuation.get("headers", [])
+        merged["headers"] = cont_h if len(cont_h) > len(base_h) else base_h
         merged["rows"] = base.get("rows", []) + continuation.get("rows", [])
     elif t == "matrix":
+        base_c = base.get("columns", [])
+        cont_c = continuation.get("columns", [])
+        merged["columns"] = cont_c if len(cont_c) > len(base_c) else base_c
         merged["rows"] = {**base.get("rows", {}), **continuation.get("rows", {})}
     elif t == "key_value":
         merged["data"] = {**base.get("data", {}), **continuation.get("data", {})}
@@ -76,7 +176,14 @@ def _merge_tables(base: dict, continuation: dict) -> dict:
 
 
 def _merge_continuation_tables(tables: list[dict]) -> list[dict]:
-    """Merge adjacent same-title tables; disambiguate with (p. N) when interrupted."""
+    """Merge same-title tables on consecutive pages; disambiguate when pages are non-consecutive.
+
+    Uses page numbers (not list-index positions) to detect continuations so that
+    interleaved tables from the same page don't break the merge.  For example, if
+    page 3 yields [TableA, TableB] and page 4 yields [TableA, TableB], the two TableA
+    fragments are on consecutive pages and are merged even though their indices in
+    `tables` differ by 2.
+    """
     from collections import defaultdict
 
     title_positions: dict[str, list[int]] = defaultdict(list)
@@ -84,12 +191,14 @@ def _merge_continuation_tables(tables: list[dict]) -> list[dict]:
         if t.get("title"):
             title_positions[t["title"]].append(i)
 
-    # Group consecutive occurrences; gap > 1 means another table interrupted
+    # Group runs where each successive occurrence is on the immediately next page.
     merge_groups: dict[str, list[list[int]]] = {}
     for title, positions in title_positions.items():
         groups: list[list[int]] = [[positions[0]]]
         for k in range(1, len(positions)):
-            if positions[k] - positions[k - 1] == 1:
+            prev_page = tables[positions[k - 1]].get("page", 0)
+            curr_page = tables[positions[k]].get("page", 0)
+            if curr_page == prev_page + 1:   # strictly consecutive pages → continuation
                 groups[-1].append(positions[k])
             else:
                 groups.append([positions[k]])

@@ -35,8 +35,16 @@ def _is_numeric(s: str) -> bool:
     s = s.strip()
     if not s:
         return False
-    if s.startswith('$') or s.endswith('%'):
+    if s.startswith('$'):
         return True
+    if s.endswith('%'):
+        # Only a percentage value (e.g. "100.00%"), not a label ending in "%" (e.g. "Imps %")
+        numeric_part = re.sub(r'[,\s]', '', s[:-1])
+        try:
+            float(numeric_part)
+            return True
+        except ValueError:
+            return False
     cleaned = re.sub(r'[,\s]', '', s)
     # Must not contain letters or slashes (avoids matching "12/29" or "P2+")
     if re.search(r'[a-zA-Z/]', cleaned):

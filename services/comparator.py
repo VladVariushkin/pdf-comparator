@@ -153,6 +153,43 @@ def _to_number(s: str):
         return None
 
 
+def _is_numeric_value(s: str) -> bool:
+    """True if s represents a numeric quantity (currency, percentage, or plain number)."""
+    s = s.strip()
+    if not s:
+        return False
+    if s.startswith('$'):
+        return True
+    if s.endswith('%'):
+        part = re.sub(r'[,\s]', '', s[:-1])
+        try:
+            float(part)
+            return True
+        except ValueError:
+            return False
+    cleaned = re.sub(r'[,\s]', '', s)
+    if re.search(r'[a-zA-Z/]', cleaned):
+        return False
+    try:
+        float(cleaned)
+        return True
+    except ValueError:
+        return False
+
+
+def _col_is_mostly_numeric(col: str, rows_a: list[dict], rows_b: list[dict]) -> bool:
+    """True if ≥80 % of non-empty values in this column are numeric quantities."""
+    vals = [
+        row.get(col, "").strip()
+        for rows in (rows_a, rows_b)
+        for row in rows
+        if row.get(col, "").strip()
+    ]
+    if not vals:
+        return False
+    return sum(1 for v in vals if _is_numeric_value(v)) / len(vals) >= 0.8
+
+
 def _to_date(s: str):
     """Return a date object if s parses as a date, else None."""
     try:
@@ -297,18 +334,25 @@ def _find_natural_key(
     headers_a: list[str],
     headers_b: list[str],
 ) -> list[str]:
-    """Return the shortest ordered prefix of columns whose values are unique
-    within rows_a AND within rows_b.  If no prefix achieves uniqueness (truly
-    duplicate rows), returns all columns — caller proceeds with last-wins dict."""
+    """Return the shortest ordered prefix of non-numeric columns whose values are
+    unique within rows_a AND within rows_b.
+
+    Columns whose values are predominantly numeric (currency, percentages, plain
+    numbers) are skipped because metric columns are not row identifiers.  If no
+    non-numeric prefix achieves uniqueness the partial key is returned; the caller
+    falls back to group-positional matching for non-unique keys.
+    """
     ordered_cols = list(dict.fromkeys(headers_a + headers_b))
     key_cols: list[str] = []
     for col in ordered_cols:
+        if _col_is_mostly_numeric(col, rows_a, rows_b):
+            continue  # metric/amount columns cannot serve as row identifiers
         key_cols.append(col)
         keys_a = [tuple(_cell_key(row.get(c, "")) for c in key_cols) for row in rows_a]
         keys_b = [tuple(_cell_key(row.get(c, "")) for c in key_cols) for row in rows_b]
         if len(keys_a) == len(set(keys_a)) and len(keys_b) == len(set(keys_b)):
             return key_cols
-    return key_cols
+    return key_cols if key_cols else (ordered_cols[:1] if ordered_cols else [])
 
 
 def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: int = 0) -> list[FieldDiff]:
@@ -344,8 +388,10 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
                                        status=status, table=table, page=page))
         return diffs
 
-    # Real headers → compound-key matching.
-    # Extend the key column-by-column until values are unique in both tables.
+    # Real headers → key-based matching.
+    # Numeric columns are excluded from the key; if the remaining non-numeric
+    # columns still don't produce unique keys, fall back to group-positional
+    # matching (first "Bravo" in A against first "Bravo" in B, etc.).
     key_cols = _find_natural_key(rows_a, rows_b, headers_a, headers_b)
     value_cols = [c for c in all_cols if c not in key_cols]
 
@@ -358,25 +404,61 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
     def _display_label(row: dict) -> str:
         return " · ".join(re.sub(r'\s+', ' ', row.get(c, "")).strip() for c in key_cols)
 
-    idx_a = {_key(r): r for r in rows_a}
-    idx_b = {_key(r): r for r in rows_b}
+    keys_a_list = [_key(r) for r in rows_a]
+    keys_b_list = [_key(r) for r in rows_b]
 
-    all_keys = list(dict.fromkeys([_key(r) for r in rows_a] + [_key(r) for r in rows_b]))
-    for k in all_keys:
-        row_a = idx_a.get(k)
-        row_b = idx_b.get(k)
-        label = _display_label(row_a or row_b)
-        for col in value_cols:
-            val_a = row_a.get(col) if row_a is not None else None
-            val_b = row_b.get(col) if row_b is not None else None
-            if val_a is None and val_b is None:
-                continue
-            status = ("only_in_b" if val_a is None else
-                      "only_in_a" if val_b is None else
-                      "match" if _values_match(val_a, val_b) else "mismatch")
-            diffs.append(FieldDiff(field=f"{prefix} › {label} › {col}",
-                                   value_a=val_a, value_b=val_b,
-                                   status=status, table=table, page=page))
+    if (len(keys_a_list) == len(set(keys_a_list)) and
+            len(keys_b_list) == len(set(keys_b_list))):
+        # Unique keys: dict-based matching (O(1) per row).
+        idx_a = {_key(r): r for r in rows_a}
+        idx_b = {_key(r): r for r in rows_b}
+        all_keys = list(dict.fromkeys(keys_a_list + keys_b_list))
+        for k in all_keys:
+            row_a = idx_a.get(k)
+            row_b = idx_b.get(k)
+            label = _display_label(row_a or row_b)
+            for col in value_cols:
+                val_a = row_a.get(col) if row_a is not None else None
+                val_b = row_b.get(col) if row_b is not None else None
+                if val_a is None and val_b is None:
+                    continue
+                status = ("only_in_b" if val_a is None else
+                          "only_in_a" if val_b is None else
+                          "match" if _values_match(val_a, val_b) else "mismatch")
+                diffs.append(FieldDiff(field=f"{prefix} › {label} › {col}",
+                                       value_a=val_a, value_b=val_b,
+                                       status=status, table=table, page=page))
+    else:
+        # Non-unique keys (all discriminating columns are numeric): group rows by
+        # the label key and match within each group positionally.
+        groups_a: dict[tuple, list[dict]] = {}
+        for r in rows_a:
+            groups_a.setdefault(_key(r), []).append(r)
+        groups_b: dict[tuple, list[dict]] = {}
+        for r in rows_b:
+            groups_b.setdefault(_key(r), []).append(r)
+
+        all_group_keys = list(dict.fromkeys(keys_a_list + keys_b_list))
+        for k in all_group_keys:
+            g_a = groups_a.get(k, [])
+            g_b = groups_b.get(k, [])
+            base_label = _display_label((g_a or g_b)[0])
+            n = max(len(g_a), len(g_b))
+            for i in range(n):
+                row_a = g_a[i] if i < len(g_a) else None
+                row_b = g_b[i] if i < len(g_b) else None
+                label = f"{base_label} ({i + 1})" if n > 1 else base_label
+                for col in value_cols:
+                    val_a = row_a.get(col) if row_a is not None else None
+                    val_b = row_b.get(col) if row_b is not None else None
+                    if val_a is None and val_b is None:
+                        continue
+                    status = ("only_in_b" if val_a is None else
+                              "only_in_a" if val_b is None else
+                              "match" if _values_match(val_a, val_b) else "mismatch")
+                    diffs.append(FieldDiff(field=f"{prefix} › {label} › {col}",
+                                           value_a=val_a, value_b=val_b,
+                                           status=status, table=table, page=page))
     return diffs
 
 
@@ -554,5 +636,5 @@ def compare_tables(tables_a: list[dict], tables_b: list[dict]) -> ComparisonResu
         table_subtitles=table_subtitles,
         summary=summary,
         warnings=warnings,
-        debug={"tables_a": tables_a, "tables_b": tables_b},
+        debug={},
     )

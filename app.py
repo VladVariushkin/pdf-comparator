@@ -122,31 +122,27 @@ def _render_result(result: object, elapsed: float, pair_key: str,
             else:
                 table_diffs = diffs_by_table.get(table_name, [])
                 failures = [d for d in table_diffs if d.status in ("mismatch", "only_in_a", "only_in_b")]
-                matches  = [d for d in table_diffs if d.status == "match"]
+                if not failures:
+                    continue
                 page = table_diffs[0].page if table_diffs else 0
                 page_info = f"  ·  p. {page}" if page else ""
                 subtitle = result.table_subtitles.get(table_name, "")
                 subtitle_info = f"  —  {subtitle}" if subtitle else ""
-                icon = "✓" if not failures else "✗"
-                label = f"{icon}  {table_name}{subtitle_info}{page_info}  —  {len(failures)} failure(s), {len(matches)} matching"
-                with st.expander(label, expanded=bool(failures)):
-                    if failures:
-                        st.dataframe(
-                            pd.DataFrame([{
-                                "Field":      d.field.split(" › ", 1)[1] if " › " in d.field else d.field,
-                                "Document A": d.value_a if d.value_a is not None else _MISSING,
-                                "Document B": d.value_b if d.value_b is not None else _MISSING,
-                                "Issue":      f"missing in {name_b}" if d.status == "only_in_a"
-                                              else f"missing in {name_a}" if d.status == "only_in_b"
-                                              else "value mismatch",
-                            } for d in failures]),
-                            use_container_width=True, hide_index=True,
-                        )
-                    if not failures:
-                        st.success(f"All {len(matches)} field(s) match.")
+                label = f"✗  {table_name}{subtitle_info}{page_info}  —  {len(failures)} failure(s)"
+                with st.expander(label, expanded=True):
+                    st.dataframe(
+                        pd.DataFrame([{
+                            "Field":      d.field.split(" › ", 1)[1] if " › " in d.field else d.field,
+                            "Document A": d.value_a if d.value_a is not None else _MISSING,
+                            "Document B": d.value_b if d.value_b is not None else _MISSING,
+                            "Issue":      f"missing in {name_b}" if d.status == "only_in_a"
+                                          else f"missing in {name_a}" if d.status == "only_in_b"
+                                          else "value mismatch",
+                        } for d in failures]),
+                        use_container_width=True, hide_index=True,
+                    )
     else:
         failures = [d for d in result.diffs if d.status in ("mismatch", "only_in_a", "only_in_b")]
-        matches  = [d for d in result.diffs if d.status == "match"]
 
         with st.expander(f"Field failures ({len(failures)})", expanded=True):
             if failures:
@@ -163,10 +159,6 @@ def _render_result(result: object, elapsed: float, pair_key: str,
                 )
             else:
                 st.success("No field failures.")
-
-        with st.expander(f"Matching fields ({len(matches)})", expanded=False):
-            if matches:
-                st.dataframe(pd.DataFrame([{"Field": d.field, "Value": d.value_a} for d in matches]), use_container_width=True, hide_index=True)
 
     if result.mode != "table_parser":
         buf = io.StringIO()
@@ -205,28 +197,37 @@ def _render_result(result: object, elapsed: float, pair_key: str,
 
 def _evaluate_pair(args):
     i, name_a, file_a, name_b, file_b, mode = args
-    bytes_a = file_a.read()
-    bytes_b = file_b.read()
-    t0 = time.perf_counter()
+    try:
+        bytes_a = file_a.read()
+        bytes_b = file_b.read()
+        t0 = time.perf_counter()
 
-    if mode == "Table parser (no AI)":
-        tables_a = extract_as_tables(bytes_a)
-        tables_b = extract_as_tables(bytes_b)
-        if not tables_a or not tables_b:
-            return i, name_a, name_b, None, 0, "Could not extract tables from one or both documents."
-        result = compare_tables(tables_a, tables_b)
-    else:
-        text_a = extract_as_text(bytes_a)
-        text_b = extract_as_text(bytes_b)
-        if not text_a or not text_b:
-            return i, name_a, name_b, None, 0, "Could not extract text from one or both documents."
-        llm = LLMClient()
-        if mode == "Structured fields (LLM)":
-            result = compare_structured(text_a, text_b, llm)
+        if mode == "Table parser (no AI)":
+            tables_a = extract_as_tables(bytes_a)
+            del bytes_a
+            tables_b = extract_as_tables(bytes_b)
+            del bytes_b
+            if not tables_a or not tables_b:
+                return i, name_a, name_b, None, 0, "Could not extract tables from one or both documents."
+            result = compare_tables(tables_a, tables_b)
         else:
-            result = compare_freeform(text_a, text_b, llm)
+            text_a = extract_as_text(bytes_a)
+            del bytes_a
+            text_b = extract_as_text(bytes_b)
+            del bytes_b
+            if not text_a or not text_b:
+                return i, name_a, name_b, None, 0, "Could not extract text from one or both documents."
+            llm = LLMClient()
+            if mode == "Structured fields (LLM)":
+                result = compare_structured(text_a, text_b, llm)
+            else:
+                result = compare_freeform(text_a, text_b, llm)
 
-    return i, name_a, name_b, result, time.perf_counter() - t0, None
+        return i, name_a, name_b, result, time.perf_counter() - t0, None
+    except MemoryError:
+        return i, name_a, name_b, None, 0, "Out of memory — PDFs are too large to process. Try uploading smaller files or processing one pair at a time."
+    except Exception as exc:
+        return i, name_a, name_b, None, 0, f"Error processing pair: {exc}"
 
 
 col_btn1, col_btn2 = st.columns(2)
@@ -263,7 +264,11 @@ if run_manual or run_bulk:
 
     excel_placeholder = st.empty()
 
-    for i, (name_a, name_b, result, elapsed, error) in enumerate(outcomes):
+    UI_PAIR_LIMIT = 5
+    render_outcomes = outcomes[:UI_PAIR_LIMIT]
+    hidden_count = n_pairs - len(render_outcomes)
+
+    for i, (name_a, name_b, result, elapsed, error) in enumerate(render_outcomes):
         if n_pairs > 1:
             st.subheader(f"Pair {i + 1}: {name_a}  ↔  {name_b}")
         else:
@@ -276,6 +281,9 @@ if run_manual or run_bulk:
 
         if n_pairs > 1:
             st.divider()
+
+    if hidden_count > 0:
+        st.info(f"{hidden_count} more pair(s) are not shown here to keep the browser responsive. All results are included in the Excel report below.")
 
     if n_pairs > 1:
         st.caption(f"All {n_pairs} pairs completed in {total_elapsed:.1f}s total")

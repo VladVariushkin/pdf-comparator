@@ -81,6 +81,11 @@ def _write_diff_row(ws, row_idx: int, d, name_a: str, name_b: str) -> None:
         cell.fill = fill
 
 
+def _display_title(title: str) -> str:
+    """Strip the '(p. N)' disambiguation suffix added internally for uniqueness."""
+    return re.sub(r'\s*\(p\.\s*[\d?]+\)\s*$', '', title)
+
+
 def _write_pair_sheet(ws, result: ComparisonResult, name_a: str, name_b: str) -> None:
     diffs_by_table: dict[str, list] = {}
     for d in result.diffs:
@@ -99,7 +104,7 @@ def _write_pair_sheet(ws, result: ComparisonResult, name_a: str, name_b: str) ->
             subtitle = result.table_subtitles.get(tname, "")
             subtitle_str = f"  —  {subtitle}" if subtitle else ""
             doc_missing = name_a if mt["missing_from"] == "A" else name_b
-            label = f"{tname}{subtitle_str}{page_str}  —  MISSING IN {doc_missing}"
+            label = f"{_display_title(tname)}{subtitle_str}{page_str}  —  MISSING IN {doc_missing}"
             _write_section_header(ws, current_row, label)
             current_row += 1
         else:
@@ -110,7 +115,7 @@ def _write_pair_sheet(ws, result: ComparisonResult, name_a: str, name_b: str) ->
             subtitle_str = f"  —  {subtitle}" if subtitle else ""
             failures = sum(1 for d in table_diffs if d.status != "match")
             status_str = "  —  OK" if failures == 0 else f"  —  {failures} issue(s)"
-            label = f"{tname}{subtitle_str}{page_str}{status_str}"
+            label = f"{_display_title(tname)}{subtitle_str}{page_str}{status_str}"
             _write_section_header(ws, current_row, label)
             current_row += 1
             for d in table_diffs:

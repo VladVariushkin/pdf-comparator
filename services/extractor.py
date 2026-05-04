@@ -22,33 +22,107 @@ def extract_as_tables(pdf_bytes: bytes) -> list[dict]:
         os.unlink(tmp_path)
 
 
+def _has_numeric(s: str) -> bool:
+    """True if s looks like a numeric quantity (currency, percentage, plain number)."""
+    import re
+    s = s.strip()
+    if s.startswith('$'):
+        return True
+    cleaned = re.sub(r'[,\s%]', '', s)
+    if not cleaned:
+        return False
+    try:
+        float(cleaned)
+        return True
+    except ValueError:
+        return False
+
+
+def _expand_single_column_df(df):
+    """Expand a 1-column DataFrame whose rows contain \\n-separated values.
+
+    camelot sometimes collapses an entire table (header + data rows) into a
+    single column when the physical table is very narrow or sits at a page
+    edge.  Each cell then holds the full row as a newline-joined string.
+
+    Reconstruction strategy
+    -----------------------
+    1. Split every cell value by \\n.
+    2. ``max_parts`` = largest part-count among DATA rows (rows that contain
+       at least one numeric value).  Using data rows as the reference prevents
+       a false expansion when the column-header row itself contained \\n (which
+       would make the header appear to have far more parts than the data rows).
+    3. If any non-data row has more parts than ``max_parts``, the column
+       headers themselves contained \\n — this is not a truly collapsed table,
+       so the DataFrame is returned unchanged.
+    4. Rows whose part-count == ``max_parts - 1`` and whose parts contain no
+       numeric values are treated as column-header rows and get an empty
+       string prepended (restoring the blank first-column label cell).
+    5. All other rows are right-padded to ``max_parts`` with empty strings.
+    """
+    import pandas as pd
+
+    rows_with_newlines = sum(1 for i in range(len(df)) if '\n' in str(df.iloc[i, 0]))
+    if rows_with_newlines < 2:
+        return df  # not a fully-collapsed table
+
+    split_rows = []
+    for i in range(len(df)):
+        val = str(df.iloc[i, 0]).strip()
+        if '\n' in val:
+            parts = [p.strip() for p in val.split('\n') if p.strip()]
+        else:
+            parts = [val] if val else ['']
+        split_rows.append(parts)
+
+    data_max = max(
+        (len(r) for r in split_rows if any(_has_numeric(p) for p in r)),
+        default=0,
+    )
+    if data_max < 2:
+        return df  # no multi-column data found
+
+    non_data_max = max(
+        (len(r) for r in split_rows if not any(_has_numeric(p) for p in r)),
+        default=0,
+    )
+    if non_data_max > data_max:
+        return df  # header cells themselves contained '\n' — not a collapsed table
+
+    max_parts = data_max
+
+    processed = []
+    for parts in split_rows:
+        if len(parts) == max_parts:
+            processed.append(parts)
+        elif len(parts) == max_parts - 1 and not any(_has_numeric(p) for p in parts):
+            processed.append([''] + parts)          # header row — prepend empty label cell
+        else:
+            processed.append(parts + [''] * (max_parts - len(parts)))
+
+    return pd.DataFrame(processed)
+
+
 def _fix_collapsed_rows(df):
     """Repair rows where camelot merged all cell data into col_0.
 
-    At page boundaries camelot sometimes collapses an entire row's values into
-    the first cell, separated by newlines.  This detects those rows
-    (non_empty==1, col_0 contains newlines AND at least one numeric/dollar
-    value) and redistributes the split parts back into the correct column
-    positions, using the most common non-empty column pattern from adjacent
-    well-parsed rows as a template.
+    Two cases are handled:
+
+    * **Single-column table** — the entire table (header + data) was collapsed
+      into one column with \\n separators.  Delegates to
+      ``_expand_single_column_df`` to reconstruct the proper column layout.
+
+    * **Multi-column table with some collapsed rows** — individual rows at
+      page boundaries have all their values in col_0 separated by \\n while
+      the rest of the table is fine.  Uses the most common non-empty column
+      pattern as a template and redistributes the \\n-split parts.
     """
-    import re
     from collections import Counter
 
-    df = df.copy()
+    if len(df.columns) == 1:
+        return _expand_single_column_df(df)
 
-    def _has_numeric(s: str) -> bool:
-        s = s.strip()
-        if s.startswith('$'):
-            return True
-        cleaned = re.sub(r'[,\s%]', '', s)
-        if not cleaned:
-            return False
-        try:
-            float(cleaned)
-            return True
-        except ValueError:
-            return False
+    df = df.copy()
 
     pattern_counter: Counter = Counter()
     for _, row in df.iterrows():
@@ -237,6 +311,96 @@ def _merge_continuation_tables(tables: list[dict]) -> list[dict]:
     return result
 
 
+def _normalize_continuation_headers(tables: list[dict]) -> list[dict]:
+    """Ensure all tables in a same-title consecutive group use identical column keys.
+
+    When a multi-page table is extracted by camelot, some pages produce real
+    column headers (e.g. 'Unit Rate') while others produce auto-generated
+    col_N headers because the header row was collapsed.  After this function
+    every table in such a group uses the canonical headers drawn from the
+    real-header page with the most columns.
+
+    Key-remapping strategy per table:
+      - Auto-generated (col_N only): positional remap col_N → canonical[N].
+      - Real headers matching canonical exactly: no change.
+      - Real headers partially matching (e.g. first cell is a combined multi-
+        column header): exact-string match first; then positional fallback.
+
+    Also normalises header names to single-line (replaces \\n with space).
+    """
+    import re
+    from collections import defaultdict
+
+    def _is_auto(headers: list[str]) -> bool:
+        return bool(headers) and all(re.match(r"^col_\d+$", h) for h in headers)
+
+    def _clean_header(h: str) -> str:
+        return re.sub(r"\s+", " ", h.replace("\n", " ")).strip()
+
+    title_indices: dict[str, list[int]] = defaultdict(list)
+    for i, t in enumerate(tables):
+        if t.get("title") and t.get("type") == "columnar":
+            title_indices[t["title"]].append(i)
+
+    result = list(tables)
+
+    for title, indices in title_indices.items():
+        if len(indices) < 2:
+            continue
+
+        # Find canonical: real headers, most columns.
+        canonical_raw: list[str] = []
+        for idx in indices:
+            headers = result[idx].get("headers", [])
+            if not _is_auto(headers) and len(headers) > len(canonical_raw):
+                canonical_raw = headers
+        if not canonical_raw:
+            continue
+
+        canonical = [_clean_header(h) for h in canonical_raw]
+        canonical_set = set(canonical)
+
+        for idx in indices:
+            t = result[idx]
+            headers = t.get("headers", [])
+            cleaned_headers = [_clean_header(h) for h in headers]
+
+            if headers == canonical:
+                continue  # already exactly canonical — row keys already match
+
+            if _is_auto(headers):
+                # col_N → canonical[N]
+                key_map = {
+                    f"col_{n}": canonical[n]
+                    for n in range(len(canonical))
+                }
+            else:
+                # Real headers, partially matching canonical.
+                # Prefer exact string match; fall back to position.
+                key_map: dict[str, str] = {}
+                for pos, h in enumerate(cleaned_headers):
+                    if h in canonical_set:
+                        key_map[h] = h
+                    elif pos < len(canonical):
+                        key_map[h] = canonical[pos]
+                    # else: leave unmapped (data kept as-is)
+
+            new_rows = []
+            for row in t.get("rows", []):
+                new_row: dict[str, str] = {}
+                for k, v in row.items():
+                    clean_k = _clean_header(k)
+                    new_row[key_map.get(clean_k, key_map.get(k, clean_k))] = v
+                new_rows.append(new_row)
+
+            updated = dict(t)
+            updated["headers"] = canonical
+            updated["rows"] = new_rows
+            result[idx] = updated
+
+    return result
+
+
 def _extract_tables(path: str) -> list[dict]:
     from services.table_parser import TableParser
 
@@ -246,6 +410,7 @@ def _extract_tables(path: str) -> list[dict]:
         if parsed:
             parsed["page"] = page_num
             tables.append(parsed)
+    tables = _normalize_continuation_headers(tables)
     return _merge_continuation_tables(tables)
 
 

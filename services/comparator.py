@@ -402,7 +402,20 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
         return tuple(_cell_key(row.get(c, "")) for c in key_cols)
 
     def _display_label(row: dict) -> str:
-        return " · ".join(re.sub(r'\s+', ' ', row.get(c, "")).strip() for c in key_cols)
+        def _sanitize(s: str) -> str:
+            if '\n' not in s:
+                return re.sub(r'\s+', ' ', s).strip()
+            lines = [l.strip() for l in s.split('\n') if l.strip()]
+            # Collapsed row: all lines after the first are numeric values — use only the label.
+            if len(lines) >= 2 and all(_is_numeric_value(l) for l in lines[1:]):
+                return lines[0]
+            return re.sub(r'\s+', ' ', s).strip()
+
+        parts = [_sanitize(row.get(c, "")) for c in key_cols]
+        # Strip trailing empty parts to avoid "Total 2Q26 · · · · " for sparse rows.
+        while parts and not parts[-1]:
+            parts.pop()
+        return " · ".join(parts) if parts else ""
 
     keys_a_list = [_key(r) for r in rows_a]
     keys_b_list = [_key(r) for r in rows_b]

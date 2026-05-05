@@ -283,18 +283,14 @@ def _merge_continuation_tables(tables: list[dict]) -> list[dict]:
         """Check if any titled table appears between two indices.
 
         Any titled table between two occurrences (in extraction order) is an
-        interruption, UNLESS it's on the same page as the previous occurrence
-        (parallel tables on one page don't break the sequence).
+        interruption. If another table appears between them, the first table
+        is complete and should not be merged with the later occurrence.
         """
         for idx in range(prev_idx + 1, curr_idx):
             t = tables[idx]
             if not t.get("title"):
                 continue
-            t_page = t.get("page", 0)
-            # Tables on the same page as prev are parallel, not interruptions
-            if t_page == prev_page:
-                continue
-            # Any other titled table is an interruption
+            # Any titled table between the two is an interruption
             return True
         return False
 
@@ -414,6 +410,14 @@ def _normalize_continuation_headers(tables: list[dict]) -> list[dict]:
 
             if headers == canonical:
                 continue  # already exactly canonical — row keys already match
+
+            # Skip normalization if column counts differ significantly (>20% difference).
+            # This indicates different table structures with the same title, not a
+            # continuation with collapsed headers.
+            if not _is_auto(headers):
+                col_diff_ratio = abs(len(headers) - len(canonical)) / max(len(headers), len(canonical))
+                if col_diff_ratio > 0.2:
+                    continue  # Different table structure, keep original headers
 
             if _is_auto(headers):
                 # col_N → canonical[N]

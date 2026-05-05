@@ -1,5 +1,8 @@
-import tempfile
 import os
+import re
+import tempfile
+
+from services.utils import is_numeric_value
 
 
 def extract_as_text(pdf_bytes: bytes) -> list[str]:
@@ -22,20 +25,8 @@ def extract_as_tables(pdf_bytes: bytes) -> list[dict]:
         os.unlink(tmp_path)
 
 
-def _has_numeric(s: str) -> bool:
-    """True if s looks like a numeric quantity (currency, percentage, plain number)."""
-    import re
-    s = s.strip()
-    if s.startswith('$'):
-        return True
-    cleaned = re.sub(r'[,\s%]', '', s)
-    if not cleaned:
-        return False
-    try:
-        float(cleaned)
-        return True
-    except ValueError:
-        return False
+# Alias for the shared utility - used by _expand_single_column_df and _fix_collapsed_rows
+_has_numeric = is_numeric_value
 
 
 def _expand_single_column_df(df):
@@ -123,6 +114,7 @@ def _fix_collapsed_rows(df):
         return _expand_single_column_df(df)
 
     df = df.copy()
+    n_cols = len(df.columns)
 
     pattern_counter: Counter = Counter()
     for _, row in df.iterrows():
@@ -147,12 +139,22 @@ def _fix_collapsed_rows(df):
         parts = [p.strip() for p in col0_val.split('\n') if p.strip()]
         if len(parts) < 2:
             continue
-        if not any(_has_numeric(p) for p in parts[1:]):
+
+        # Data row: has numeric values after first part
+        if any(_has_numeric(p) for p in parts[1:]):
+            if len(parts) == len(template_indices):
+                for col_pos, col_idx in enumerate(template_indices):
+                    df.iat[idx, col_idx] = parts[col_pos]
             continue
-        if len(parts) != len(template_indices):
-            continue
-        for col_pos, col_idx in enumerate(template_indices):
-            df.iat[idx, col_idx] = parts[col_pos]
+
+        # Header row: no numeric values, parts count matches column count
+        # Headers often have the column count or close to it
+        if len(parts) == n_cols or len(parts) == len(template_indices):
+            target_len = n_cols if len(parts) == n_cols else len(template_indices)
+            target_indices = tuple(range(target_len)) if len(parts) == n_cols else template_indices
+            for col_pos, col_idx in enumerate(target_indices):
+                if col_pos < len(parts):
+                    df.iat[idx, col_idx] = parts[col_pos]
 
     return df
 
@@ -160,7 +162,9 @@ def _fix_collapsed_rows(df):
 def _extract_dfs(path: str):
     import camelot
 
-    table_list = camelot.read_pdf(path, pages="all", flavor="lattice")
+    # line_scale=40 helps camelot detect thin vertical lines that separate columns.
+    # Without it, camelot sometimes merges adjacent columns on certain pages.
+    table_list = camelot.read_pdf(path, pages="all", flavor="lattice", line_scale=40)
     try:
         for table in table_list:
             yield table.parsing_report.get("page", 0), _fix_collapsed_rows(table.df)
@@ -220,7 +224,12 @@ def _extract(path: str) -> list[str]:
 
 
 def _disambiguate_titles(tables: list[dict]) -> list[dict]:
-    """Append '(p. N)' to any title that appears on more than one page."""
+    """Append '(p. N)' to any title that appears on more than one page.
+
+    Note: This is a standalone utility for simple disambiguation. The production
+    pipeline uses _merge_continuation_tables instead, which merges consecutive-page
+    tables and only disambiguates non-consecutive duplicates.
+    """
     counts: dict[str, int] = {}
     for t in tables:
         if t.get("title"):
@@ -328,7 +337,6 @@ def _normalize_continuation_headers(tables: list[dict]) -> list[dict]:
 
     Also normalises header names to single-line (replaces \\n with space).
     """
-    import re
     from collections import defaultdict
 
     def _is_auto(headers: list[str]) -> bool:
@@ -348,13 +356,24 @@ def _normalize_continuation_headers(tables: list[dict]) -> list[dict]:
         if len(indices) < 2:
             continue
 
-        # Find canonical: real headers, most columns.
+        # Find canonical: real headers with most columns.
+        # But if auto-headers have MORE columns than any real headers,
+        # camelot likely merged columns incorrectly on real-header pages.
+        # In that case, skip normalization to avoid data loss.
+        max_auto_cols = max(
+            (len(result[idx].get("headers", [])) for idx in indices
+             if _is_auto(result[idx].get("headers", []))),
+            default=0
+        )
         canonical_raw: list[str] = []
         for idx in indices:
             headers = result[idx].get("headers", [])
             if not _is_auto(headers) and len(headers) > len(canonical_raw):
                 canonical_raw = headers
         if not canonical_raw:
+            continue
+        # Skip normalization if auto pages have more columns - structure is inconsistent
+        if max_auto_cols > len(canonical_raw):
             continue
 
         canonical = [_clean_header(h) for h in canonical_raw]

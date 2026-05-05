@@ -2,6 +2,7 @@ import re
 
 from models.comparison import ComparisonResult, FieldDiff, ValidationWarning
 from services.llm_client import LLMClient
+from services.utils import is_numeric_value
 from services.validator import validate
 
 _SINGLE_EXTRACT_SYSTEM = (
@@ -146,35 +147,19 @@ def _normalise_fields(raw: dict) -> dict:
 
 def _to_number(s: str):
     """Return float if s encodes a number, else None."""
-    cleaned = re.sub(r'[^\d.]', '', s.replace(',', ''))
+    # Preserve negative sign, strip currency symbols, commas, spaces
+    cleaned = re.sub(r'[^\d.\-]', '', s.replace(',', ''))
+    # Handle edge cases: multiple dots, leading dot, etc.
+    if not cleaned or cleaned in ('.', '-', '-.'):
+        return None
     try:
-        return float(cleaned) if cleaned else None
+        return float(cleaned)
     except ValueError:
         return None
 
 
-def _is_numeric_value(s: str) -> bool:
-    """True if s represents a numeric quantity (currency, percentage, or plain number)."""
-    s = s.strip()
-    if not s:
-        return False
-    if s.startswith('$'):
-        return True
-    if s.endswith('%'):
-        part = re.sub(r'[,\s]', '', s[:-1])
-        try:
-            float(part)
-            return True
-        except ValueError:
-            return False
-    cleaned = re.sub(r'[,\s]', '', s)
-    if re.search(r'[a-zA-Z/]', cleaned):
-        return False
-    try:
-        float(cleaned)
-        return True
-    except ValueError:
-        return False
+# Alias for backward compatibility and internal use
+_is_numeric_value = is_numeric_value
 
 
 def _col_is_mostly_numeric(col: str, rows_a: list[dict], rows_b: list[dict]) -> bool:
@@ -395,6 +380,57 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
     key_cols = _find_natural_key(rows_a, rows_b, headers_a, headers_b)
     value_cols = [c for c in all_cols if c not in key_cols]
 
+    def _realign_row(row: dict) -> dict:
+        """Fix column misalignment in summary/total rows caused by merged cells.
+
+        When camelot extracts a row with merged cells (e.g., "Total" spanning
+        multiple columns), values shift left into wrong column slots, leaving
+        gaps. We detect this by finding empty columns between filled ones and
+        shifting the early values right to fill those gaps.
+        """
+        if not row:
+            return row
+
+        # Check if this is a summary row (only first key column has text label)
+        non_empty_keys = sum(
+            1 for kc in key_cols
+            if row.get(kc, "").strip() and not _is_numeric_value(row.get(kc, "").strip())
+        )
+        if non_empty_keys > 1:
+            return row  # Not a summary row, skip
+
+        # Get value column data
+        values = [row.get(vc, "").strip() for vc in value_cols]
+
+        # Find first empty position and last filled position
+        first_empty = next((i for i, v in enumerate(values) if not v), len(values))
+        last_filled = max((i for i, v in enumerate(values) if v), default=-1)
+
+        # If empty columns exist BEFORE the last filled column, values are shifted left
+        if first_empty >= last_filled:
+            return row  # No middle gaps, no shift needed
+
+        # Count empty columns in the middle (the gap caused by merged cells)
+        shift = sum(1 for i in range(first_empty, last_filled) if not values[i])
+        if shift == 0:
+            return row
+
+        # Shift values that come before the gap to the right
+        new_values = [""] * len(values)
+        for i, v in enumerate(values):
+            if v:
+                if i < first_empty:
+                    new_i = i + shift
+                    if new_i < len(values):
+                        new_values[new_i] = v
+                else:
+                    new_values[i] = v
+
+        new_row = dict(row)
+        for vc, v in zip(value_cols, new_values):
+            new_row[vc] = v
+        return new_row
+
     def _key(row: dict) -> tuple:
         # Fingerprint-based key: order-invariant alphanumeric tokens per cell.
         # Handles PDF text-wrap differences where the same cell is extracted
@@ -415,6 +451,9 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
         # Strip trailing empty parts to avoid "Total 2Q26 · · · · " for sparse rows.
         while parts and not parts[-1]:
             parts.pop()
+        # Filter out purely numeric parts — these are column-misalignment artifacts
+        # from summary rows where merged cells shift metric values into text column slots.
+        parts = [p for p in parts if p and not _is_numeric_value(p)]
         return " · ".join(parts) if parts else ""
 
     keys_a_list = [_key(r) for r in rows_a]
@@ -427,8 +466,8 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
         idx_b = {_key(r): r for r in rows_b}
         all_keys = list(dict.fromkeys(keys_a_list + keys_b_list))
         for k in all_keys:
-            row_a = idx_a.get(k)
-            row_b = idx_b.get(k)
+            row_a = _realign_row(idx_a.get(k))
+            row_b = _realign_row(idx_b.get(k))
             label = _display_label(row_a or row_b)
             for col in value_cols:
                 val_a = row_a.get(col) if row_a is not None else None
@@ -442,36 +481,69 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
                                        value_a=val_a, value_b=val_b,
                                        status=status, table=table, page=page))
     else:
-        # Non-unique keys (all discriminating columns are numeric): group rows by
-        # the label key and match within each group positionally.
-        groups_a: dict[tuple, list[dict]] = {}
-        for r in rows_a:
-            groups_a.setdefault(_key(r), []).append(r)
+        # Non-unique keys: match rows by key occurrence number, preserve A's row order.
+        # Build occurrence index for each key in A
+        key_occurrences_a: dict[tuple, list[int]] = {}
+        for i, k in enumerate(keys_a_list):
+            key_occurrences_a.setdefault(k, []).append(i)
+
         groups_b: dict[tuple, list[dict]] = {}
         for r in rows_b:
-            groups_b.setdefault(_key(r), []).append(r)
+            k = _key(r)
+            groups_b.setdefault(k, []).append(r)
 
-        all_group_keys = list(dict.fromkeys(keys_a_list + keys_b_list))
-        for k in all_group_keys:
-            g_a = groups_a.get(k, [])
-            g_b = groups_b.get(k, [])
-            base_label = _display_label((g_a or g_b)[0])
-            n = max(len(g_a), len(g_b))
-            for i in range(n):
-                row_a = g_a[i] if i < len(g_a) else None
-                row_b = g_b[i] if i < len(g_b) else None
-                label = f"{base_label} ({i + 1})" if n > 1 else base_label
-                for col in value_cols:
-                    val_a = row_a.get(col) if row_a is not None else None
+        # Determine which keys need occurrence numbers (appear more than once in either)
+        needs_number = {k for k in set(keys_a_list) | set(keys_b_list)
+                        if keys_a_list.count(k) > 1 or keys_b_list.count(k) > 1}
+
+        # Collect diffs with sort order: (original_row_index, column_index, diff)
+        indexed_diffs: list[tuple[int, int, FieldDiff]] = []
+
+        # Process each row in A's original order
+        for i, row_a in enumerate(rows_a):
+            k = keys_a_list[i]
+            occ_idx = key_occurrences_a[k].index(i)  # which occurrence of this key is this row?
+
+            row_a = _realign_row(row_a)
+            rows_b_for_key = groups_b.get(k, [])
+            row_b = _realign_row(rows_b_for_key[occ_idx]) if occ_idx < len(rows_b_for_key) else None
+
+            base_label = _display_label(row_a)
+            label = f"{base_label} ({occ_idx + 1})" if k in needs_number else base_label
+
+            for col_idx, col in enumerate(value_cols):
+                val_a = row_a.get(col) if row_a is not None else None
+                val_b = row_b.get(col) if row_b is not None else None
+                if val_a is None and val_b is None:
+                    continue
+                status = ("only_in_b" if val_a is None else
+                          "only_in_a" if val_b is None else
+                          "match" if _values_match(val_a, val_b) else "mismatch")
+                indexed_diffs.append((i, col_idx, FieldDiff(
+                    field=f"{prefix} › {label} › {col}",
+                    value_a=val_a, value_b=val_b,
+                    status=status, table=table, page=page)))
+
+        # Handle extra occurrences in B (more occurrences than A)
+        for k, rows_b_list in groups_b.items():
+            a_count = len(key_occurrences_a.get(k, []))
+            for occ_idx in range(a_count, len(rows_b_list)):
+                row_b = _realign_row(rows_b_list[occ_idx])
+                base_label = _display_label(row_b)
+                label = f"{base_label} ({occ_idx + 1})" if k in needs_number else base_label
+
+                for col_idx, col in enumerate(value_cols):
                     val_b = row_b.get(col) if row_b is not None else None
-                    if val_a is None and val_b is None:
+                    if val_b is None:
                         continue
-                    status = ("only_in_b" if val_a is None else
-                              "only_in_a" if val_b is None else
-                              "match" if _values_match(val_a, val_b) else "mismatch")
-                    diffs.append(FieldDiff(field=f"{prefix} › {label} › {col}",
-                                           value_a=val_a, value_b=val_b,
-                                           status=status, table=table, page=page))
+                    indexed_diffs.append((len(rows_a), col_idx, FieldDiff(
+                        field=f"{prefix} › {label} › {col}",
+                        value_a=None, value_b=val_b,
+                        status="only_in_b", table=table, page=page)))
+
+        # Sort by original row index, then column index, and extract diffs
+        indexed_diffs.sort(key=lambda x: (x[0], x[1]))
+        diffs.extend(d for _, _, d in indexed_diffs)
     return diffs
 
 

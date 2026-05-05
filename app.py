@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from services.extractor import extract_as_text, extract_as_tables
+from services.excel_extractor import extract_as_tables as extract_excel_tables
 from services.comparator import compare_structured, compare_freeform, compare_tables
 from services.llm_client import LLMClient
 from services.pairer import pair_by_name
@@ -19,16 +20,47 @@ from services.pairer import pair_by_name
 st.set_page_config(page_title="Doc Compare", layout="wide")
 st.title("Document Comparison")
 
+# File type selection
+with st.sidebar:
+    st.subheader("Settings")
+    file_type_mode = st.selectbox(
+        "File Type",
+        ["Auto-detect", "PDF", "Excel"],
+        help="Auto-detect determines file type from extension. Use manual selection to override."
+    )
+
 mode = "Table parser (no AI)"
 
+
+def _detect_file_type(filename: str) -> str:
+    """Detect file type from extension."""
+    lower = filename.lower()
+    if lower.endswith('.pdf'):
+        return "pdf"
+    elif lower.endswith('.xlsx') or lower.endswith('.xls'):
+        return "excel"
+    return "unknown"
+
+
+def _get_accepted_types(file_type_mode: str) -> list[str]:
+    """Get list of accepted file extensions based on mode."""
+    if file_type_mode == "PDF":
+        return ["pdf"]
+    elif file_type_mode == "Excel":
+        return ["xlsx", "xls"]
+    else:  # Auto-detect
+        return ["pdf", "xlsx", "xls"]
+
 tab_manual, tab_bulk = st.tabs(["Manual", "Bulk"])
+
+accepted_types = _get_accepted_types(file_type_mode)
 
 with tab_manual:
     col_a, col_b = st.columns(2)
     with col_a:
-        files_a = st.file_uploader("Document A", type=["pdf"], accept_multiple_files=True, key="files_a")
+        files_a = st.file_uploader("Document A", type=accepted_types, accept_multiple_files=True, key="files_a")
     with col_b:
-        files_b = st.file_uploader("Document B", type=["pdf"], accept_multiple_files=True, key="files_b")
+        files_b = st.file_uploader("Document B", type=accepted_types, accept_multiple_files=True, key="files_b")
 
     if files_a and files_b and len(files_a) != len(files_b):
         st.warning(f"Unequal number of files: {len(files_a)} in A, {len(files_b)} in B. Pairs are matched by position.")
@@ -37,9 +69,10 @@ with tab_manual:
     manual_n_pairs = min(len(files_a), len(files_b))
 
 with tab_bulk:
+    bulk_label = "Upload all files (Before + After)" if file_type_mode == "Auto-detect" else f"Upload all {file_type_mode} files (Before + After)"
     bulk_files = st.file_uploader(
-        "Upload all PDFs (Before + After)",
-        type=["pdf"],
+        bulk_label,
+        type=accepted_types,
         accept_multiple_files=True,
         key="bulk_files",
     )
@@ -76,11 +109,15 @@ def _render_result(result: object, elapsed: float, pair_key: str,
                    name_a: str = "Document A", name_b: str = "Document B") -> None:
     n_match          = sum(1 for d in result.diffs if d.status == "match")
     n_mismatch       = sum(1 for d in result.diffs if d.status == "mismatch")
+    n_formula        = sum(1 for d in result.diffs if d.status == "formula_mismatch")
     n_unique         = sum(1 for d in result.diffs if d.status in ("only_in_a", "only_in_b"))
     n_missing_tables = len(result.missing_tables)
-    n_issues         = n_mismatch + n_unique + n_missing_tables
+    n_issues         = n_mismatch + n_formula + n_unique + n_missing_tables
 
-    caption_parts = [f"{n_match} matching", f"{n_mismatch} differing", f"{n_unique} unique to one document"]
+    caption_parts = [f"{n_match} matching", f"{n_mismatch} differing"]
+    if n_formula:
+        caption_parts.append(f"{n_formula} formula diff(s)")
+    caption_parts.append(f"{n_unique} unique to one document")
     if n_missing_tables:
         caption_parts.append(f"{n_missing_tables} missing table(s)")
     caption_parts.append(f"completed in {elapsed:.1f}s")
@@ -121,7 +158,7 @@ def _render_result(result: object, elapsed: float, pair_key: str,
                     st.error(f"Present in {doc_present} — not found in {doc_missing}")
             else:
                 table_diffs = diffs_by_table.get(table_name, [])
-                failures = [d for d in table_diffs if d.status in ("mismatch", "only_in_a", "only_in_b")]
+                failures = [d for d in table_diffs if d.status in ("mismatch", "formula_mismatch", "only_in_a", "only_in_b")]
                 if not failures:
                     continue
                 page = table_diffs[0].page if table_diffs else 0
@@ -130,19 +167,32 @@ def _render_result(result: object, elapsed: float, pair_key: str,
                 subtitle_info = f"  —  {subtitle}" if subtitle else ""
                 label = f"✗  {table_name}{subtitle_info}{page_info}  —  {len(failures)} failure(s)"
                 with st.expander(label, expanded=True):
-                    st.dataframe(
-                        pd.DataFrame([{
+                    def _format_row(d):
+                        row = {
                             "Field":      d.field.split(" › ", 1)[1] if " › " in d.field else d.field,
                             "Document A": d.value_a if d.value_a is not None else _MISSING,
                             "Document B": d.value_b if d.value_b is not None else _MISSING,
-                            "Issue":      f"missing in {name_b}" if d.status == "only_in_a"
-                                          else f"missing in {name_a}" if d.status == "only_in_b"
-                                          else "value mismatch",
-                        } for d in failures]),
+                        }
+                        if d.status == "only_in_a":
+                            row["Issue"] = f"missing in {name_b}"
+                        elif d.status == "only_in_b":
+                            row["Issue"] = f"missing in {name_a}"
+                        elif d.status == "formula_mismatch":
+                            row["Issue"] = "formula differs"
+                            if d.formula_a:
+                                row["Document A"] = f"{row['Document A']} [{d.formula_a}]"
+                            if d.formula_b:
+                                row["Document B"] = f"{row['Document B']} [{d.formula_b}]"
+                        else:
+                            row["Issue"] = "value mismatch"
+                        return row
+
+                    st.dataframe(
+                        pd.DataFrame([_format_row(d) for d in failures]),
                         use_container_width=True, hide_index=True,
                     )
     else:
-        failures = [d for d in result.diffs if d.status in ("mismatch", "only_in_a", "only_in_b")]
+        failures = [d for d in result.diffs if d.status in ("mismatch", "formula_mismatch", "only_in_a", "only_in_b")]
 
         with st.expander(f"Field failures ({len(failures)})", expanded=True):
             if failures:
@@ -196,21 +246,42 @@ def _render_result(result: object, elapsed: float, pair_key: str,
 
 
 def _evaluate_pair(args):
-    i, name_a, file_a, name_b, file_b, mode = args
+    i, name_a, file_a, name_b, file_b, mode, file_type_mode = args
     try:
         bytes_a = file_a.read()
         bytes_b = file_b.read()
         t0 = time.perf_counter()
 
+        # Determine file type
+        if file_type_mode == "Auto-detect":
+            type_a = _detect_file_type(name_a)
+            type_b = _detect_file_type(name_b)
+            if type_a != type_b:
+                return i, name_a, name_b, None, 0, f"Mixed file types: {name_a} is {type_a}, {name_b} is {type_b}. Both files must be the same type."
+            file_type = type_a
+        elif file_type_mode == "PDF":
+            file_type = "pdf"
+        else:
+            file_type = "excel"
+
         if mode == "Table parser (no AI)":
-            tables_a = extract_as_tables(bytes_a)
-            del bytes_a
-            tables_b = extract_as_tables(bytes_b)
-            del bytes_b
+            if file_type == "excel":
+                tables_a = extract_excel_tables(bytes_a, name_a)
+                del bytes_a
+                tables_b = extract_excel_tables(bytes_b, name_b)
+                del bytes_b
+            else:
+                tables_a = extract_as_tables(bytes_a)
+                del bytes_a
+                tables_b = extract_as_tables(bytes_b)
+                del bytes_b
+
             if not tables_a or not tables_b:
                 return i, name_a, name_b, None, 0, "Could not extract tables from one or both documents."
             result = compare_tables(tables_a, tables_b)
         else:
+            if file_type == "excel":
+                return i, name_a, name_b, None, 0, "LLM modes are not supported for Excel files. Use Table parser mode."
             text_a = extract_as_text(bytes_a)
             del bytes_a
             text_b = extract_as_text(bytes_b)
@@ -225,7 +296,9 @@ def _evaluate_pair(args):
 
         return i, name_a, name_b, result, time.perf_counter() - t0, None
     except MemoryError:
-        return i, name_a, name_b, None, 0, "Out of memory — PDFs are too large to process. Try uploading smaller files or processing one pair at a time."
+        return i, name_a, name_b, None, 0, "Out of memory — files are too large to process. Try uploading smaller files or processing one pair at a time."
+    except ValueError as exc:
+        return i, name_a, name_b, None, 0, str(exc)
     except Exception as exc:
         return i, name_a, name_b, None, 0, f"Error processing pair: {exc}"
 
@@ -239,14 +312,14 @@ with col_btn2:
 if run_manual or run_bulk:
     if run_manual:
         pair_args = [
-            (i, files_a[i].name, files_a[i], files_b[i].name, files_b[i], mode)
+            (i, files_a[i].name, files_a[i], files_b[i].name, files_b[i], mode, file_type_mode)
             for i in range(manual_n_pairs)
         ]
         n_pairs = manual_n_pairs
     else:
         file_map = {f.name: f for f in bulk_files}
         pair_args = [
-            (i, a, file_map[a], b, file_map[b], mode)
+            (i, a, file_map[a], b, file_map[b], mode, file_type_mode)
             for i, (a, b) in enumerate(bulk_pairs_detected)
         ]
         n_pairs = len(bulk_pairs_detected)

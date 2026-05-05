@@ -165,10 +165,10 @@ _is_numeric_value = is_numeric_value
 def _col_is_mostly_numeric(col: str, rows_a: list[dict], rows_b: list[dict]) -> bool:
     """True if ≥80 % of non-empty values in this column are numeric quantities."""
     vals = [
-        row.get(col, "").strip()
+        _get_cell_str(row.get(col, "")).strip()
         for rows in (rows_a, rows_b)
         for row in rows
-        if row.get(col, "").strip()
+        if _get_cell_str(row.get(col, "")).strip()
     ]
     if not vals:
         return False
@@ -182,6 +182,67 @@ def _to_date(s: str):
         return dparser.parse(s, fuzzy=True).date()
     except Exception:
         return None
+
+
+def _extract_cell_value(cell) -> tuple[str, str | None]:
+    """Extract value and formula from a cell.
+
+    Args:
+        cell: Either a string value or a dict with 'value' and 'formula' keys
+
+    Returns:
+        Tuple of (value_string, formula_or_none)
+    """
+    if isinstance(cell, dict):
+        return cell.get("value", ""), cell.get("formula")
+    return str(cell) if cell is not None else "", None
+
+
+def _get_cell_str(cell) -> str:
+    """Get the string value from a cell (handles both string and dict cells)."""
+    if isinstance(cell, dict):
+        return str(cell.get("value", ""))
+    return str(cell) if cell is not None else ""
+
+
+def _compare_cells(cell_a, cell_b) -> tuple[str, str | None, str | None]:
+    """Compare two cells and return status with formula info.
+
+    Args:
+        cell_a: Cell from document A
+        cell_b: Cell from document B
+
+    Returns:
+        Tuple of (status, formula_a, formula_b)
+        status is one of: "match", "mismatch", "formula_mismatch", "only_in_a", "only_in_b"
+    """
+    val_a, formula_a = _extract_cell_value(cell_a)
+    val_b, formula_b = _extract_cell_value(cell_b)
+
+    # Handle empty cells
+    a_empty = val_a is None or val_a == ""
+    b_empty = val_b is None or val_b == ""
+
+    if a_empty and b_empty:
+        return "match", None, None
+    if a_empty:
+        return "only_in_b", None, formula_b
+    if b_empty:
+        return "only_in_a", formula_a, None
+
+    # Both cells have values - check formulas first
+    # If both have formulas, compare formulas (even if values look different due to [Formula: ...] display)
+    if formula_a and formula_b:
+        if formula_a == formula_b:
+            return "match", None, None
+        else:
+            return "formula_mismatch", formula_a, formula_b
+
+    # At most one has a formula - compare values
+    if not _values_match(val_a, val_b):
+        return "mismatch", formula_a, formula_b
+
+    return "match", None, None
 
 
 def _values_match(a: str, b: str) -> bool:
@@ -299,17 +360,24 @@ def compare_freeform(sections_a: list[str], sections_b: list[str], llm: LLMClien
 def _diff_key_value(data_a: dict, data_b: dict, prefix: str, *, table: str = "", page: int = 0) -> list[FieldDiff]:
     diffs = []
     for key in dict.fromkeys(list(data_a) + list(data_b)):
-        val_a = data_a.get(key)
-        val_b = data_b.get(key)
-        if val_a is None:
-            status = "only_in_b"
-        elif val_b is None:
-            status = "only_in_a"
-        elif _values_match(val_a, val_b):
-            status = "match"
-        else:
-            status = "mismatch"
-        diffs.append(FieldDiff(field=f"{prefix} › {key}", value_a=val_a, value_b=val_b, status=status, table=table, page=page))
+        cell_a = data_a.get(key)
+        cell_b = data_b.get(key)
+
+        val_a, _ = _extract_cell_value(cell_a) if cell_a is not None else ("", None)
+        val_b, _ = _extract_cell_value(cell_b) if cell_b is not None else ("", None)
+
+        status, formula_a, formula_b = _compare_cells(cell_a, cell_b)
+
+        diffs.append(FieldDiff(
+            field=f"{prefix} › {key}",
+            value_a=val_a if val_a else None,
+            value_b=val_b if val_b else None,
+            status=status,
+            table=table,
+            page=page,
+            formula_a=formula_a,
+            formula_b=formula_b,
+        ))
     return diffs
 
 
@@ -362,15 +430,22 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
             row_a = rows_a[i] if i < len(rows_a) else {}
             row_b = rows_b[i] if i < len(rows_b) else {}
             for col in all_cols:
-                val_a, val_b = row_a.get(col), row_b.get(col)
-                if val_a is None and val_b is None:
+                cell_a, cell_b = row_a.get(col), row_b.get(col)
+                if cell_a is None and cell_b is None:
                     continue
-                status = ("only_in_b" if val_a is None else
-                          "only_in_a" if val_b is None else
-                          "match" if _values_match(val_a, val_b) else "mismatch")
-                diffs.append(FieldDiff(field=f"{prefix} › Row {i + 1} › {col}",
-                                       value_a=val_a, value_b=val_b,
-                                       status=status, table=table, page=page))
+                val_a, _ = _extract_cell_value(cell_a) if cell_a is not None else ("", None)
+                val_b, _ = _extract_cell_value(cell_b) if cell_b is not None else ("", None)
+                status, formula_a, formula_b = _compare_cells(cell_a, cell_b)
+                diffs.append(FieldDiff(
+                    field=f"{prefix} › Row {i + 1} › {col}",
+                    value_a=val_a if val_a else None,
+                    value_b=val_b if val_b else None,
+                    status=status,
+                    table=table,
+                    page=page,
+                    formula_a=formula_a,
+                    formula_b=formula_b,
+                ))
         return diffs
 
     # Real headers → key-based matching.
@@ -383,59 +458,25 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
     def _realign_row(row: dict) -> dict:
         """Fix column misalignment in summary/total rows caused by merged cells.
 
+        NOTE: This function is currently disabled because it was incorrectly
+        triggering on legitimate rows that have some empty columns in the middle
+        (like Unit (000) being empty for summary rows). The heuristic for detecting
+        "misaligned" rows was too aggressive.
+
         When camelot extracts a row with merged cells (e.g., "Total" spanning
         multiple columns), values shift left into wrong column slots, leaving
-        gaps. We detect this by finding empty columns between filled ones and
-        shifting the early values right to fill those gaps.
+        gaps. The original intent was to detect this by finding empty columns
+        between filled ones and shift early values right.
+
+        For now, we return rows unchanged to avoid incorrect value shifts.
         """
-        if not row:
-            return row
-
-        # Check if this is a summary row (only first key column has text label)
-        non_empty_keys = sum(
-            1 for kc in key_cols
-            if row.get(kc, "").strip() and not _is_numeric_value(row.get(kc, "").strip())
-        )
-        if non_empty_keys > 1:
-            return row  # Not a summary row, skip
-
-        # Get value column data
-        values = [row.get(vc, "").strip() for vc in value_cols]
-
-        # Find first empty position and last filled position
-        first_empty = next((i for i, v in enumerate(values) if not v), len(values))
-        last_filled = max((i for i, v in enumerate(values) if v), default=-1)
-
-        # If empty columns exist BEFORE the last filled column, values are shifted left
-        if first_empty >= last_filled:
-            return row  # No middle gaps, no shift needed
-
-        # Count empty columns in the middle (the gap caused by merged cells)
-        shift = sum(1 for i in range(first_empty, last_filled) if not values[i])
-        if shift == 0:
-            return row
-
-        # Shift values that come before the gap to the right
-        new_values = [""] * len(values)
-        for i, v in enumerate(values):
-            if v:
-                if i < first_empty:
-                    new_i = i + shift
-                    if new_i < len(values):
-                        new_values[new_i] = v
-                else:
-                    new_values[i] = v
-
-        new_row = dict(row)
-        for vc, v in zip(value_cols, new_values):
-            new_row[vc] = v
-        return new_row
+        return row
 
     def _key(row: dict) -> tuple:
         # Fingerprint-based key: order-invariant alphanumeric tokens per cell.
         # Handles PDF text-wrap differences where the same cell is extracted
         # with different internal line breaks across document versions.
-        return tuple(_cell_key(row.get(c, "")) for c in key_cols)
+        return tuple(_cell_key(_get_cell_str(row.get(c, ""))) for c in key_cols)
 
     def _display_label(row: dict) -> str:
         def _sanitize(s: str) -> str:
@@ -447,7 +488,7 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
                 return lines[0]
             return re.sub(r'\s+', ' ', s).strip()
 
-        parts = [_sanitize(row.get(c, "")) for c in key_cols]
+        parts = [_sanitize(_get_cell_str(row.get(c, ""))) for c in key_cols]
         # Strip trailing empty parts to avoid "Total 2Q26 · · · · " for sparse rows.
         while parts and not parts[-1]:
             parts.pop()
@@ -469,17 +510,25 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
             row_a = _realign_row(idx_a.get(k))
             row_b = _realign_row(idx_b.get(k))
             label = _display_label(row_a or row_b)
-            for col in value_cols:
-                val_a = row_a.get(col) if row_a is not None else None
-                val_b = row_b.get(col) if row_b is not None else None
-                if val_a is None and val_b is None:
+            # Show ALL columns as value fields (including key columns) so user sees complete row data
+            for col in all_cols:
+                cell_a = row_a.get(col) if row_a is not None else None
+                cell_b = row_b.get(col) if row_b is not None else None
+                if cell_a is None and cell_b is None:
                     continue
-                status = ("only_in_b" if val_a is None else
-                          "only_in_a" if val_b is None else
-                          "match" if _values_match(val_a, val_b) else "mismatch")
-                diffs.append(FieldDiff(field=f"{prefix} › {label} › {col}",
-                                       value_a=val_a, value_b=val_b,
-                                       status=status, table=table, page=page))
+                val_a, _ = _extract_cell_value(cell_a) if cell_a is not None else ("", None)
+                val_b, _ = _extract_cell_value(cell_b) if cell_b is not None else ("", None)
+                status, formula_a, formula_b = _compare_cells(cell_a, cell_b)
+                diffs.append(FieldDiff(
+                    field=f"{prefix} › {label} › {col}",
+                    value_a=val_a if val_a else None,
+                    value_b=val_b if val_b else None,
+                    status=status,
+                    table=table,
+                    page=page,
+                    formula_a=formula_a,
+                    formula_b=formula_b,
+                ))
     else:
         # Non-unique keys: match rows by key occurrence number, preserve A's row order.
         # Build occurrence index for each key in A
@@ -511,18 +560,25 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
             base_label = _display_label(row_a)
             label = f"{base_label} ({occ_idx + 1})" if k in needs_number else base_label
 
-            for col_idx, col in enumerate(value_cols):
-                val_a = row_a.get(col) if row_a is not None else None
-                val_b = row_b.get(col) if row_b is not None else None
-                if val_a is None and val_b is None:
+            # Show ALL columns as value fields (including key columns) so user sees complete row data
+            for col_idx, col in enumerate(all_cols):
+                cell_a = row_a.get(col) if row_a is not None else None
+                cell_b = row_b.get(col) if row_b is not None else None
+                if cell_a is None and cell_b is None:
                     continue
-                status = ("only_in_b" if val_a is None else
-                          "only_in_a" if val_b is None else
-                          "match" if _values_match(val_a, val_b) else "mismatch")
+                val_a, _ = _extract_cell_value(cell_a) if cell_a is not None else ("", None)
+                val_b, _ = _extract_cell_value(cell_b) if cell_b is not None else ("", None)
+                status, formula_a, formula_b = _compare_cells(cell_a, cell_b)
                 indexed_diffs.append((i, col_idx, FieldDiff(
                     field=f"{prefix} › {label} › {col}",
-                    value_a=val_a, value_b=val_b,
-                    status=status, table=table, page=page)))
+                    value_a=val_a if val_a else None,
+                    value_b=val_b if val_b else None,
+                    status=status,
+                    table=table,
+                    page=page,
+                    formula_a=formula_a,
+                    formula_b=formula_b,
+                )))
 
         # Handle extra occurrences in B (more occurrences than A)
         for k, rows_b_list in groups_b.items():
@@ -532,14 +588,23 @@ def _diff_columnar(ta: dict, tb: dict, prefix: str, *, table: str = "", page: in
                 base_label = _display_label(row_b)
                 label = f"{base_label} ({occ_idx + 1})" if k in needs_number else base_label
 
-                for col_idx, col in enumerate(value_cols):
-                    val_b = row_b.get(col) if row_b is not None else None
-                    if val_b is None:
+                # Show ALL columns as value fields (including key columns) so user sees complete row data
+                for col_idx, col in enumerate(all_cols):
+                    cell_b = row_b.get(col) if row_b is not None else None
+                    if cell_b is None:
+                        continue
+                    val_b, formula_b = _extract_cell_value(cell_b)
+                    if not val_b:
                         continue
                     indexed_diffs.append((len(rows_a), col_idx, FieldDiff(
                         field=f"{prefix} › {label} › {col}",
-                        value_a=None, value_b=val_b,
-                        status="only_in_b", table=table, page=page)))
+                        value_a=None,
+                        value_b=val_b,
+                        status="only_in_b",
+                        table=table,
+                        page=page,
+                        formula_b=formula_b,
+                    )))
 
         # Sort by original row index, then column index, and extract diffs
         indexed_diffs.sort(key=lambda x: (x[0], x[1]))
@@ -556,19 +621,23 @@ def _diff_matrix(ta: dict, tb: dict, prefix: str, *, table: str = "", page: int 
         row_a = ta.get("rows", {}).get(row_label, {})
         row_b = tb.get("rows", {}).get(row_label, {})
         for col in all_cols:
-            val_a = row_a.get(col)
-            val_b = row_b.get(col)
-            if val_a is None and val_b is None:
+            cell_a = row_a.get(col)
+            cell_b = row_b.get(col)
+            if cell_a is None and cell_b is None:
                 continue
-            if val_a is None:
-                status = "only_in_b"
-            elif val_b is None:
-                status = "only_in_a"
-            elif _values_match(val_a, val_b):
-                status = "match"
-            else:
-                status = "mismatch"
-            diffs.append(FieldDiff(field=f"{prefix} › {row_label} › {col}", value_a=val_a, value_b=val_b, status=status, table=table, page=page))
+            val_a, _ = _extract_cell_value(cell_a) if cell_a is not None else ("", None)
+            val_b, _ = _extract_cell_value(cell_b) if cell_b is not None else ("", None)
+            status, formula_a, formula_b = _compare_cells(cell_a, cell_b)
+            diffs.append(FieldDiff(
+                field=f"{prefix} › {row_label} › {col}",
+                value_a=val_a if val_a else None,
+                value_b=val_b if val_b else None,
+                status=status,
+                table=table,
+                page=page,
+                formula_a=formula_a,
+                formula_b=formula_b,
+            ))
     return diffs
 
 
@@ -691,6 +760,7 @@ def compare_tables(tables_a: list[dict], tables_b: list[dict]) -> ComparisonResu
             diffs.extend(_diff_matrix(ta, tb, prefix, table=prefix, page=page))
 
     n_mismatch = sum(1 for d in diffs if d.status == "mismatch")
+    n_formula_mismatch = sum(1 for d in diffs if d.status == "formula_mismatch")
     n_only_a = sum(1 for d in diffs if d.status == "only_in_a")
     n_only_b = sum(1 for d in diffs if d.status == "only_in_b")
 
@@ -702,6 +772,8 @@ def compare_tables(tables_a: list[dict], tables_b: list[dict]) -> ComparisonResu
             parts.append(f"{len(missing_tables)} missing table(s)")
         if n_mismatch:
             parts.append(f"{n_mismatch} mismatched value(s)")
+        if n_formula_mismatch:
+            parts.append(f"{n_formula_mismatch} formula difference(s)")
         if n_only_a:
             parts.append(f"{n_only_a} field(s) only in A")
         if n_only_b:

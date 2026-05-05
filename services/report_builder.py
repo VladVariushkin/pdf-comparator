@@ -9,11 +9,12 @@ from openpyxl.utils import get_column_letter
 from models.comparison import ComparisonResult
 
 _FILLS = {
-    "match":     PatternFill("solid", fgColor="FFC6EFCE"),
-    "mismatch":  PatternFill("solid", fgColor="FFFFC7CE"),
-    "only_in_a": PatternFill("solid", fgColor="FFFFEB9C"),
-    "only_in_b": PatternFill("solid", fgColor="FFFFEB9C"),
-    "missing":   PatternFill("solid", fgColor="FFD9D9D9"),
+    "match":            PatternFill("solid", fgColor="FFC6EFCE"),  # Green
+    "mismatch":         PatternFill("solid", fgColor="FFFFC7CE"),  # Red
+    "formula_mismatch": PatternFill("solid", fgColor="FFFFA500"),  # Orange
+    "only_in_a":        PatternFill("solid", fgColor="FFFFEB9C"),  # Yellow
+    "only_in_b":        PatternFill("solid", fgColor="FFFFEB9C"),  # Yellow
+    "missing":          PatternFill("solid", fgColor="FFD9D9D9"),  # Grey
 }
 _HEADER_FILL  = PatternFill("solid", fgColor="FF4472C4")
 _SECTION_FILL = PatternFill("solid", fgColor="FF7030A0")   # purple for table section headers
@@ -70,13 +71,26 @@ def _write_section_header(ws, row: int, label: str) -> None:
 
 def _write_diff_row(ws, row_idx: int, d, name_a: str, name_b: str) -> None:
     field_label = d.field.split(" › ", 1)[1] if " › " in d.field else d.field
-    status_label = (
-        f"missing in {name_b}" if d.status == "only_in_a"
-        else f"missing in {name_a}" if d.status == "only_in_b"
-        else d.status
-    )
+
+    # Build value strings - include formula info for formula_mismatch
+    val_a_str = d.value_a or ""
+    val_b_str = d.value_b or ""
+
+    if d.status == "formula_mismatch":
+        if d.formula_a:
+            val_a_str = f"{val_a_str} [{d.formula_a}]"
+        if d.formula_b:
+            val_b_str = f"{val_b_str} [{d.formula_b}]"
+        status_label = "formula differs"
+    elif d.status == "only_in_a":
+        status_label = f"missing in {name_b}"
+    elif d.status == "only_in_b":
+        status_label = f"missing in {name_a}"
+    else:
+        status_label = d.status
+
     fill = _FILLS.get(d.status, _FILLS["mismatch"])
-    for col_idx, val in enumerate([field_label, d.value_a or "", d.value_b or "", status_label], 1):
+    for col_idx, val in enumerate([field_label, val_a_str, val_b_str, status_label], 1):
         cell = ws.cell(row=row_idx, column=col_idx, value=val)
         cell.fill = fill
 

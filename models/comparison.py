@@ -6,9 +6,11 @@ class FieldDiff:
     field: str
     value_a: str | None
     value_b: str | None
-    status: str   # "match" | "mismatch" | "only_in_a" | "only_in_b"
+    status: str   # "match" | "mismatch" | "formula_mismatch" | "only_in_a" | "only_in_b"
     table: str = ""   # table title this diff belongs to (table_parser mode)
-    page: int = 0     # PDF page the table appeared on
+    page: int = 0     # PDF page or Excel sheet the table appeared on
+    formula_a: str | None = None  # Excel formula in doc A (if formula_mismatch)
+    formula_b: str | None = None  # Excel formula in doc B (if formula_mismatch)
 
 
 @dataclass

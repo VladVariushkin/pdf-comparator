@@ -266,6 +266,11 @@ def _merge_continuation_tables(tables: list[dict]) -> list[dict]:
     page 3 yields [TableA, TableB] and page 4 yields [TableA, TableB], the two TableA
     fragments are on consecutive pages and are merged even though their indices in
     `tables` differ by 2.
+
+    However, if another table appears BETWEEN two occurrences of the same title in
+    extraction order and that interrupting table is on a page between the two
+    occurrences, the merge is blocked - those are distinct tables that happen to
+    share a name.
     """
     from collections import defaultdict
 
@@ -274,17 +279,40 @@ def _merge_continuation_tables(tables: list[dict]) -> list[dict]:
         if t.get("title"):
             title_positions[t["title"]].append(i)
 
-    # Group runs where each successive occurrence is on the immediately next page.
+    def _has_interrupting_table(prev_idx: int, curr_idx: int, prev_page: int, curr_page: int) -> bool:
+        """Check if any titled table appears between two indices.
+
+        Any titled table between two occurrences (in extraction order) is an
+        interruption, UNLESS it's on the same page as the previous occurrence
+        (parallel tables on one page don't break the sequence).
+        """
+        for idx in range(prev_idx + 1, curr_idx):
+            t = tables[idx]
+            if not t.get("title"):
+                continue
+            t_page = t.get("page", 0)
+            # Tables on the same page as prev are parallel, not interruptions
+            if t_page == prev_page:
+                continue
+            # Any other titled table is an interruption
+            return True
+        return False
+
+    # Group runs where each successive occurrence is on the immediately next page
+    # AND no other table interrupts between them.
     merge_groups: dict[str, list[list[int]]] = {}
     for title, positions in title_positions.items():
         groups: list[list[int]] = [[positions[0]]]
         for k in range(1, len(positions)):
-            prev_page = tables[positions[k - 1]].get("page", 0)
-            curr_page = tables[positions[k]].get("page", 0)
-            if curr_page == prev_page + 1:   # strictly consecutive pages → continuation
-                groups[-1].append(positions[k])
+            prev_idx = positions[k - 1]
+            curr_idx = positions[k]
+            prev_page = tables[prev_idx].get("page", 0)
+            curr_page = tables[curr_idx].get("page", 0)
+            # Merge only if pages are consecutive AND no interrupting table exists
+            if curr_page == prev_page + 1 and not _has_interrupting_table(prev_idx, curr_idx, prev_page, curr_page):
+                groups[-1].append(curr_idx)
             else:
-                groups.append([positions[k]])
+                groups.append([curr_idx])
         merge_groups[title] = groups
 
     needs_disambiguation = {

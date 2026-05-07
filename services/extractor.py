@@ -1,8 +1,11 @@
 import os
 import re
 import tempfile
+import threading
 
 from services.utils import is_numeric_value
+
+_camelot_sem = threading.Semaphore(int(os.getenv("CAMELOT_CONCURRENCY", "1")))
 
 
 def extract_as_text(pdf_bytes: bytes) -> list[str]:
@@ -164,7 +167,8 @@ def _extract_dfs(path: str):
 
     # line_scale=40 helps camelot detect thin vertical lines that separate columns.
     # Without it, camelot sometimes merges adjacent columns on certain pages.
-    table_list = camelot.read_pdf(path, pages="all", flavor="lattice", line_scale=40)
+    with _camelot_sem:
+        table_list = camelot.read_pdf(path, pages="all", flavor="lattice", line_scale=40, resolution=150)
     try:
         for table in table_list:
             yield table.parsing_report.get("page", 0), _fix_collapsed_rows(table.df)
@@ -180,7 +184,8 @@ def _extract(path: str) -> list[str]:
     with pdfplumber.open(path) as plumber:
         n_pages = len(plumber.pages)
 
-        lattice_tables = camelot.read_pdf(path, pages="all", flavor="lattice")
+        with _camelot_sem:
+            lattice_tables = camelot.read_pdf(path, pages="all", flavor="lattice", resolution=150)
         lattice_by_page: dict[int, list] = {}
         for t in lattice_tables:
             p = t.parsing_report.get("page", 0)
@@ -192,11 +197,13 @@ def _extract(path: str) -> list[str]:
         )
         stream_by_page: dict[int, list] = {}
         if low_accuracy_pages:
-            stream_tables = camelot.read_pdf(
-                path,
-                pages=",".join(str(p) for p in low_accuracy_pages),
-                flavor="stream",
-            )
+            with _camelot_sem:
+                stream_tables = camelot.read_pdf(
+                    path,
+                    pages=",".join(str(p) for p in low_accuracy_pages),
+                    flavor="stream",
+                    resolution=150,
+                )
             for t in stream_tables:
                 p = t.parsing_report.get("page", 0)
                 stream_by_page.setdefault(p, []).append(t)

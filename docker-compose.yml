@@ -1,15 +1,57 @@
 services:
-  pdf-comparator:
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  api:
     build: .
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --workers 4
     ports:
-      - "8501:8501"
+      - "8080:8000"
     env_file:
       - .env
     environment:
-      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
-      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
-      - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT}
+      REDIS_URL: redis://redis:6379
+      JOB_TTL_SECONDS: "600"
+      MAX_QUEUE_DEPTH: "20"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  worker:
+    build: .
+    command: celery -A tasks worker --loglevel=info --pool=threads --concurrency=3
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      JOB_TTL_SECONDS: "600"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: 4g
+
+  redis-ui:
+    image: rediscommander/redis-commander:latest
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    restart: unless-stopped

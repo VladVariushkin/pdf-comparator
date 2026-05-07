@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Doc Comparator</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; font-size: 14px; background: #f5f5f5; color: #222; }
+    header { background: #1a1a2e; color: #fff; padding: 16px 24px; }
+    header h1 { font-size: 20px; font-weight: 600; }
+    .container { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+
+    .card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+    .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 14px; color: #444; }
+
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .col { flex: 1; min-width: 200px; }
+
+    label { display: block; font-size: 12px; font-weight: 500; color: #666; margin-bottom: 4px; }
+    select, input[type=file] {
+      width: 100%; padding: 7px 10px; border: 1px solid #ccc; border-radius: 5px;
+      font-size: 13px; background: #fafafa;
+    }
+    input[type=file] { padding: 5px; }
+
+    .btn {
+      display: inline-block; padding: 9px 22px; border: none; border-radius: 5px;
+      font-size: 14px; font-weight: 600; cursor: pointer; transition: opacity .15s;
+    }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-primary { background: #1a1a2e; color: #fff; }
+    .btn-primary:hover:not(:disabled) { opacity: .85; }
+    .btn-download { background: #16a34a; color: #fff; margin-left: 10px; }
+    .btn-download:hover { opacity: .85; }
+
+    .status-bar {
+      display: none; align-items: center; gap: 10px;
+      padding: 10px 16px; background: #eef2ff; border-radius: 6px;
+      border: 1px solid #c7d2fe; margin-bottom: 16px;
+    }
+    .status-bar.visible { display: flex; }
+    .spinner {
+      width: 16px; height: 16px; border: 2px solid #818cf8;
+      border-top-color: transparent; border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .pair-block { margin-bottom: 24px; }
+    .pair-header {
+      font-size: 15px; font-weight: 600; padding: 10px 0;
+      border-bottom: 2px solid #e5e7eb; margin-bottom: 12px;
+    }
+    .caption { font-size: 12px; color: #666; margin-bottom: 10px; }
+    .caption .ok  { color: #16a34a; }
+    .caption .err { color: #dc2626; }
+
+    .error-box {
+      background: #fef2f2; border: 1px solid #fca5a5;
+      border-radius: 6px; padding: 10px 14px; color: #b91c1c; font-size: 13px;
+    }
+    .summary-box {
+      background: #eff6ff; border: 1px solid #bfdbfe;
+      border-radius: 6px; padding: 10px 14px; color: #1e40af;
+      font-size: 13px; margin-bottom: 10px;
+    }
+
+    details { margin-bottom: 10px; }
+    summary {
+      cursor: pointer; padding: 8px 12px; background: #f3f4f6;
+      border: 1px solid #e5e7eb; border-radius: 6px; font-weight: 500;
+      font-size: 13px; user-select: none; list-style: none;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::before { content: "▶ "; font-size: 10px; }
+    details[open] summary::before { content: "▼ "; }
+    .details-body { padding: 10px 0; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+    th { background: #f9fafb; text-align: left; padding: 6px 10px; border-bottom: 2px solid #e5e7eb; }
+    td { padding: 5px 10px; border-bottom: 1px solid #f0f0f0; vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    .status-mismatch  td:first-child { border-left: 3px solid #dc2626; }
+    .status-formula   td:first-child { border-left: 3px solid #d97706; }
+    .status-only-a    td:first-child { border-left: 3px solid #7c3aed; }
+    .status-only-b    td:first-child { border-left: 3px solid #0891b2; }
+    .status-missing   td:first-child { border-left: 3px solid #6b7280; }
+
+    .warn-box {
+      background: #fffbeb; border: 1px solid #fde68a;
+      border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #92400e;
+      margin-bottom: 4px;
+    }
+
+    .tag {
+      display: inline-block; padding: 2px 7px; border-radius: 20px;
+      font-size: 11px; font-weight: 600;
+    }
+    .tag-mismatch  { background: #fee2e2; color: #991b1b; }
+    .tag-formula   { background: #fef3c7; color: #92400e; }
+    .tag-missing-a { background: #ede9fe; color: #5b21b6; }
+    .tag-missing-b { background: #cffafe; color: #155e75; }
+    .tag-absent    { background: #f3f4f6; color: #374151; }
+
+    .missing-table-box {
+      background: #fef2f2; border: 1px solid #fca5a5;
+      border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #7f1d1d;
+      margin-bottom: 6px;
+    }
+
+    .tabs { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 2px solid #e5e7eb; }
+    .tab-btn {
+      padding: 7px 18px; font-size: 13px; font-weight: 500; border: none;
+      background: none; cursor: pointer; color: #666; border-bottom: 2px solid transparent;
+      margin-bottom: -2px; transition: color .15s;
+    }
+    .tab-btn.active { color: #1a1a2e; border-bottom-color: #1a1a2e; font-weight: 600; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    .pairs-preview { margin: 12px 0; }
+    .pairs-preview table { font-size: 12px; }
+    .pairs-preview th { background: #f9fafb; }
+    .unmatched-box {
+      background: #fffbeb; border: 1px solid #fde68a;
+      border-radius: 6px; padding: 8px 12px; font-size: 12px; color: #92400e;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Doc Comparator</h1>
+</header>
+<div class="container">
+
+  <!-- Controls -->
+  <div class="card">
+    <h2>Upload documents</h2>
+
+    <div class="row" style="margin-bottom:14px">
+      <div class="col" style="max-width:220px">
+        <label for="fileType">File type</label>
+        <select id="fileType">
+          <option value="Auto-detect">Auto-detect</option>
+          <option value="PDF">PDF</option>
+          <option value="Excel">Excel</option>
+        </select>
+      </div>
+    </div>
+    <input type="hidden" id="mode" value="Table parser (no AI)" />
+
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="manual">Manual</button>
+      <button class="tab-btn" data-tab="bulk">Bulk</button>
+    </div>
+
+    <!-- Manual tab -->
+    <div class="tab-panel active" id="tab-manual">
+      <div class="row" style="margin-bottom:16px">
+        <div class="col">
+          <label for="filesA">Document A (Before)</label>
+          <input type="file" id="filesA" multiple accept=".pdf,.xlsx,.xls" />
+        </div>
+        <div class="col">
+          <label for="filesB">Document B (After)</label>
+          <input type="file" id="filesB" multiple accept=".pdf,.xlsx,.xls" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Bulk tab -->
+    <div class="tab-panel" id="tab-bulk">
+      <div style="margin-bottom:10px">
+        <label for="filesBulk">Upload all files (Before + After) — filenames must contain "Before" or "After"</label>
+        <input type="file" id="filesBulk" multiple accept=".pdf,.xlsx,.xls" />
+      </div>
+      <div class="pairs-preview" id="pairsPreview"></div>
+    </div>
+
+    <button class="btn btn-primary" id="compareBtn" disabled>Compare</button>
+    <button class="btn btn-download" id="reportBtn" style="display:none">⬇ Download Excel Report</button>
+  </div>
+
+  <!-- Status bar -->
+  <div class="status-bar" id="statusBar">
+    <div class="spinner"></div>
+    <span id="statusText">Evaluating…</span>
+  </div>
+
+  <!-- Results -->
+  <div id="results"></div>
+</div>
+
+<script>
+  const API = '';   // same origin
+  let _pollInterval = null;
+  let _jobId = null;
+  let _activeTab = 'manual';
+  let _pollCount = 0;
+  let _pollErrors = 0;
+  let _jobStartTime = null;
+  let _bulkPairs = [];   // [{before, after}] confirmed from /pair-preview
+
+  const filesA = document.getElementById('filesA');
+  const filesB = document.getElementById('filesB');
+  const filesBulk = document.getElementById('filesBulk');
+  const compareBtn = document.getElementById('compareBtn');
+  const reportBtn = document.getElementById('reportBtn');
+  const statusBar = document.getElementById('statusBar');
+  const statusText = document.getElementById('statusText');
+  const resultsEl = document.getElementById('results');
+  const pairsPreview = document.getElementById('pairsPreview');
+
+  // ── Tabs ──────────────────────────────────────────────────────────────────
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      _activeTab = btn.dataset.tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === `tab-${_activeTab}`));
+      updateCompareBtn();
+    });
+  });
+
+  // ── Manual tab ────────────────────────────────────────────────────────────
+  function updateCompareBtn() {
+    if (_activeTab === 'manual') {
+      compareBtn.disabled = !(filesA.files.length > 0 && filesB.files.length > 0);
+    } else {
+      compareBtn.disabled = _bulkPairs.length === 0;
+    }
+  }
+  filesA.addEventListener('change', updateCompareBtn);
+  filesB.addEventListener('change', updateCompareBtn);
+
+  // ── Bulk tab ──────────────────────────────────────────────────────────────
+  filesBulk.addEventListener('change', async () => {
+    _bulkPairs = [];
+    pairsPreview.innerHTML = '';
+    updateCompareBtn();
+    if (!filesBulk.files.length) return;
+
+    const filenames = Array.from(filesBulk.files).map(f => f.name);
+    let preview;
+    try {
+      const r = await fetch(`${API}/pair-preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filenames }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      preview = await r.json();
+    } catch (e) {
+      pairsPreview.innerHTML = `<div class="error-box">Pairing failed: ${e.message}</div>`;
+      return;
+    }
+
+    _bulkPairs = preview.pairs;
+    updateCompareBtn();
+
+    let html = '';
+    if (preview.pairs.length) {
+      html += `<p style="font-size:12px;color:#444;margin-bottom:6px"><strong>${preview.pairs.length} pair(s) detected:</strong></p>`;
+      html += '<table><thead><tr><th>#</th><th>Before</th><th>After</th></tr></thead><tbody>';
+      preview.pairs.forEach((p, i) => {
+        html += `<tr><td>${i + 1}</td><td>${esc(p.before)}</td><td>${esc(p.after)}</td></tr>`;
+      });
+      html += '</tbody></table>';
+    } else {
+      html += '<p style="font-size:12px;color:#666">No pairs detected. Filenames must contain "Before" or "After".</p>';
+    }
+    if (preview.unmatched.length) {
+      html += `<div class="unmatched-box">Could not pair: ${preview.unmatched.map(esc).join(', ')}</div>`;
+    }
+    pairsPreview.innerHTML = html;
+  });
+
+  reportBtn.addEventListener('click', async () => {
+    const jobId = reportBtn.dataset.jobId;
+    if (!jobId) return;
+    reportBtn.disabled = true;
+    reportBtn.textContent = 'Generating…';
+    try {
+      const r = await fetch(`${API}/jobs/${jobId}/report`);
+      if (!r.ok) throw new Error(await r.text());
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const ts = new Date().toISOString().slice(0, 19).replace('T', '_').replace(/:/g, '-');
+      a.download = `comparison_report_${ts}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert(`Report download failed: ${e.message}`);
+    } finally {
+      reportBtn.disabled = false;
+      reportBtn.textContent = '⬇ Download Excel Report';
+    }
+  });
+
+  compareBtn.addEventListener('click', async () => {
+    // Clean up any previous job that still has a pending report
+    if (_jobId) { fetch(`${API}/jobs/${_jobId}`, { method: 'DELETE' }).catch(() => {}); }
+    if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }
+    resultsEl.innerHTML = '';
+    reportBtn.style.display = 'none';
+    reportBtn.dataset.jobId = '';
+    compareBtn.disabled = true;
+
+    const fd = new FormData();
+    fd.append('mode', document.getElementById('mode').value);
+    fd.append('file_type_mode', document.getElementById('fileType').value);
+
+    if (_activeTab === 'manual') {
+      for (const f of filesA.files) fd.append('files_a', f, f.name);
+      for (const f of filesB.files) fd.append('files_b', f, f.name);
+    } else {
+      // Bulk: resolve File objects by name in pair order
+      const byName = {};
+      for (const f of filesBulk.files) byName[f.name] = f;
+      for (const p of _bulkPairs) {
+        fd.append('files_a', byName[p.before], p.before);
+        fd.append('files_b', byName[p.after], p.after);
+      }
+    }
+
+    let job;
+    try {
+      const r = await fetch(`${API}/jobs`, { method: 'POST', body: fd });
+      if (r.status === 429) {
+        const body = await r.json().catch(() => ({}));
+        resultsEl.innerHTML = `<div class="warn-box">⏳ ${body.detail || 'Server is busy — please wait a moment and try again.'}</div>`;
+        compareBtn.disabled = false;
+        return;
+      }
+      if (!r.ok) throw new Error((await r.json().catch(() => ({detail: r.statusText}))).detail);
+      job = await r.json();
+    } catch (e) {
+      resultsEl.innerHTML = `<div class="error-box">Failed to submit job: ${e.message}</div>`;
+      compareBtn.disabled = false;
+      return;
+    }
+
+    _jobId = job.job_id;
+    _pollCount = 0;
+    _pollErrors = 0;
+    _jobStartTime = Date.now();
+    statusBar.classList.add('visible');
+    statusText.textContent = `Submitted — waiting for a processing slot…`;
+
+    _pollInterval = setInterval(() => poll(_jobId, job.n_pairs), 2000);
+  });
+
+  function _elapsed() {
+    const s = Math.floor((Date.now() - _jobStartTime) / 1000);
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+  }
+
+  async function poll(jobId, total) {
+    let data;
+    try {
+      const r = await fetch(`${API}/jobs/${jobId}`);
+      if (!r.ok) throw new Error(await r.text());
+      data = await r.json();
+      _pollErrors = 0;
+    } catch (e) {
+      _pollErrors++;
+      if (_pollErrors <= 3) {
+        statusText.textContent = `Server is restarting — your job will resume automatically… (${_elapsed()})`;
+      } else {
+        statusText.textContent = `Connection lost — retrying… (${_elapsed()})`;
+      }
+      return;
+    }
+
+    _pollCount++;
+    if (data.done === 0) {
+      statusText.textContent = _pollCount <= 1
+        ? `Submitted — waiting for a processing slot… (${_elapsed()})`
+        : `In queue — please keep this tab open… (${_elapsed()})`;
+    } else {
+      statusText.textContent = `Processing: ${data.done} / ${data.total} pairs complete… (${_elapsed()})`;
+    }
+    renderPartial(data);
+
+    if (data.status === 'done') {
+      clearInterval(_pollInterval);
+      _pollInterval = null;
+      statusBar.classList.remove('visible');
+      compareBtn.disabled = false;
+
+      // Show report button if any table_parser result exists; keep job alive until clicked
+      const hasTableParser = data.pairs.some(p => p.comparison?.mode === 'table_parser');
+      if (hasTableParser) {
+        reportBtn.dataset.jobId = jobId;
+        reportBtn.style.display = 'inline-block';
+        // _jobId stays set so a new comparison click will clean up the old job first
+      } else {
+        fetch(`${API}/jobs/${jobId}`, { method: 'DELETE' }).catch(() => {});
+        _jobId = null;
+      }
+    }
+  }
+
+  function renderPartial(data) {
+    resultsEl.innerHTML = '';
+    data.pairs.forEach((pair, idx) => {
+      if (!pair.comparison && !pair.error) return;  // still running
+      const block = document.createElement('div');
+      block.className = 'card pair-block';
+
+      const hdr = document.createElement('div');
+      hdr.className = 'pair-header';
+      hdr.textContent = data.total > 1
+        ? `Pair ${idx + 1}: ${pair.name_a}  ↔  ${pair.name_b}`
+        : `${pair.name_a}  ↔  ${pair.name_b}`;
+      block.appendChild(hdr);
+
+      if (pair.error) {
+        block.innerHTML += `<div class="error-box">${pair.error}</div>`;
+      } else {
+        block.appendChild(renderComparison(pair.comparison, pair.elapsed, pair.name_a, pair.name_b));
+      }
+      resultsEl.appendChild(block);
+    });
+  }
+
+  function renderComparison(cmp, elapsed, nameA, nameB) {
+    const frag = document.createDocumentFragment();
+    const c = cmp.counts;
+    const nIssues = c.mismatch + c.formula_mismatch + c.only_in_a + c.only_in_b + c.missing_tables;
+
+    // Caption
+    const cap = document.createElement('p');
+    cap.className = 'caption';
+    const parts = [`${c.match} matching`, `${c.mismatch} differing`];
+    if (c.formula_mismatch) parts.push(`${c.formula_mismatch} formula diff(s)`);
+    parts.push(`${c.only_in_a + c.only_in_b} unique to one document`);
+    if (c.missing_tables) parts.push(`${c.missing_tables} missing table(s)`);
+    parts.push(`completed in ${elapsed.toFixed(1)}s`);
+    cap.innerHTML = `<span class="${nIssues === 0 ? 'ok' : 'err'}">${nIssues === 0 ? '✓' : '!'}</span> ${parts.join(' · ')}`;
+    frag.appendChild(cap);
+
+    // Summary
+    if (cmp.summary) {
+      const sb = document.createElement('div');
+      sb.className = 'summary-box';
+      sb.textContent = cmp.summary;
+      frag.appendChild(sb);
+    }
+
+    // Warnings
+    if (cmp.warnings.length) {
+      const det = document.createElement('details');
+      det.open = true;
+      const RULE_LABELS = {
+        line_item_total: 'Line-item total mismatch',
+        date_ordering: 'Date ordering issue',
+        duplicate_rows: 'Duplicate rows detected',
+        duplicate_columns: 'Duplicate columns detected',
+      };
+      det.innerHTML = `<summary>⚠ ${cmp.warnings.length} consistency warning(s)</summary>`;
+      const body = document.createElement('div');
+      body.className = 'details-body';
+      cmp.warnings.forEach(w => {
+        const d = document.createElement('div');
+        d.className = 'warn-box';
+        d.textContent = `Document ${w.document} · ${RULE_LABELS[w.rule] || w.rule}: ${w.detail}`;
+        body.appendChild(d);
+      });
+      det.appendChild(body);
+      frag.appendChild(det);
+    }
+
+    // Tables
+    if (cmp.mode === 'table_parser' && cmp.table_order.length) {
+      const missingByTitle = {};
+      cmp.missing_tables.forEach(m => missingByTitle[m.title] = m);
+
+      const diffsByTable = {};
+      cmp.diffs.forEach(d => {
+        if (!diffsByTable[d.table]) diffsByTable[d.table] = [];
+        diffsByTable[d.table].push(d);
+      });
+
+      cmp.table_order.forEach(title => {
+        if (missingByTitle[title]) {
+          const m = missingByTitle[title];
+          const docMissing = m.missing_from === 'A' ? nameA : nameB;
+          const docPresent = m.missing_from === 'A' ? nameB : nameA;
+          const pageInfo = m.page ? `  ·  p. ${m.page}` : '';
+          const sub = cmp.table_subtitles[title] ? `  —  ${cmp.table_subtitles[title]}` : '';
+          const det = document.createElement('details');
+          det.open = true;
+          det.innerHTML = `<summary>✗  ${title}${sub}${pageInfo}</summary>`;
+          const body = document.createElement('div');
+          body.className = 'details-body';
+          body.innerHTML = `<div class="missing-table-box">Present in ${docPresent} — not found in ${docMissing}</div>`;
+          det.appendChild(body);
+          frag.appendChild(det);
+          return;
+        }
+
+        const tableDiffs = diffsByTable[title] || [];
+        const failures = tableDiffs.filter(d => ['mismatch','formula_mismatch','only_in_a','only_in_b'].includes(d.status));
+        if (!failures.length) return;
+
+        const page = tableDiffs[0]?.page || 0;
+        const pageInfo = page ? `  ·  p. ${page}` : '';
+        const sub = cmp.table_subtitles[title] ? `  —  ${cmp.table_subtitles[title]}` : '';
+        const det = document.createElement('details');
+        det.open = true;
+        det.innerHTML = `<summary>✗  ${title}${sub}${pageInfo}  —  ${failures.length} failure(s)</summary>`;
+        const body = document.createElement('div');
+        body.className = 'details-body';
+        body.appendChild(buildFailureTable(failures, nameA, nameB));
+        det.appendChild(body);
+        frag.appendChild(det);
+      });
+    } else {
+      // Non-table-parser mode — flat failure list
+      const failures = cmp.diffs.filter(d => ['mismatch','formula_mismatch','only_in_a','only_in_b'].includes(d.status));
+      const det = document.createElement('details');
+      det.open = true;
+      det.innerHTML = `<summary>Field failures (${failures.length})</summary>`;
+      const body = document.createElement('div');
+      body.className = 'details-body';
+      if (failures.length) {
+        body.appendChild(buildFailureTable(failures, nameA, nameB));
+      } else {
+        body.innerHTML = '<p style="color:#16a34a;padding:8px 0">No field failures.</p>';
+      }
+      det.appendChild(body);
+      frag.appendChild(det);
+    }
+
+    return frag;
+  }
+
+  function buildFailureTable(diffs, nameA, nameB) {
+    const MISSING = '— (missing)';
+    const tbl = document.createElement('table');
+    tbl.innerHTML = `<thead><tr><th>Field</th><th>${nameA}</th><th>${nameB}</th><th>Issue</th></tr></thead>`;
+    const tbody = document.createElement('tbody');
+    diffs.forEach(d => {
+      const tr = document.createElement('tr');
+      const fieldLabel = d.field.includes(' › ') ? d.field.split(' › ').slice(1).join(' › ') : d.field;
+      let vA = d.value_a ?? MISSING;
+      let vB = d.value_b ?? MISSING;
+      let issue = 'value mismatch';
+      let cls = 'status-mismatch';
+
+      if (d.status === 'formula_mismatch') {
+        issue = 'formula differs';
+        cls = 'status-formula';
+        if (d.formula_a) vA += ` [${d.formula_a}]`;
+        if (d.formula_b) vB += ` [${d.formula_b}]`;
+      } else if (d.status === 'only_in_a') {
+        issue = `missing in ${nameB}`;
+        cls = 'status-only-a';
+      } else if (d.status === 'only_in_b') {
+        issue = `missing in ${nameA}`;
+        cls = 'status-only-b';
+      }
+
+      tr.className = cls;
+      tr.innerHTML = `<td>${esc(fieldLabel)}</td><td>${esc(vA)}</td><td>${esc(vB)}</td><td>${esc(issue)}</td>`;
+      tbody.appendChild(tr);
+    });
+    tbl.appendChild(tbody);
+    return tbl;
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  window.addEventListener('beforeunload', () => {
+    if (_jobId) {
+      navigator.sendBeacon(`${API}/jobs/${_jobId}/cancel`);
+    }
+  });
+
+</script>
+</body>
+</html>

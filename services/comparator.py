@@ -781,7 +781,6 @@ def compare_tables(tables_a: list[dict], tables_b: list[dict]) -> ComparisonResu
         summary = "Found " + ", ".join(parts) + "."
 
     warnings = (
-        _check_duplicate_rows(tables_a, "A") + _check_duplicate_rows(tables_b, "B") +
         _check_duplicate_cols(tables_a, "A") + _check_duplicate_cols(tables_b, "B")
     )
 

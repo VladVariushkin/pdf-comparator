@@ -15,7 +15,7 @@ def extract_as_text(pdf_bytes: bytes) -> list[str]:
         os.unlink(tmp_path)
 
 
-def extract_as_tables(pdf_bytes: bytes) -> list[dict]:
+def extract_as_tables(pdf_bytes: bytes, filename: str = "") -> list[dict]:
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name

@@ -10,8 +10,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from services.extractor import extract_as_text, extract_as_tables
-from services.excel_extractor import extract_as_tables as extract_excel_tables
+from services.extractor import extract_as_text
+from services import extractor as _pdf_extractor
+from services import excel_extractor as _excel_extractor
 from services.comparator import compare_structured, compare_freeform, compare_tables
 from services.llm_client import LLMClient
 from services.pairer import pair_by_name
@@ -90,7 +91,6 @@ with tab_bulk:
                     [{"#": i + 1, "Document A (Before)": a, "Document B (After)": b}
                      for i, (a, b) in enumerate(bulk_pairs_detected)]
                 ),
-                use_container_width=True,
                 hide_index=True,
             )
         else:
@@ -189,7 +189,7 @@ def _render_result(result: object, elapsed: float, pair_key: str,
 
                     st.dataframe(
                         pd.DataFrame([_format_row(d) for d in failures]),
-                        use_container_width=True, hide_index=True,
+                        hide_index=True,
                     )
     else:
         failures = [d for d in result.diffs if d.status in ("mismatch", "formula_mismatch", "only_in_a", "only_in_b")]
@@ -205,7 +205,7 @@ def _render_result(result: object, elapsed: float, pair_key: str,
                                       else f"missing in {name_a}" if d.status == "only_in_b"
                                       else "value mismatch",
                     } for d in failures]),
-                    use_container_width=True, hide_index=True,
+                    hide_index=True,
                 )
             else:
                 st.success("No field failures.")
@@ -265,16 +265,11 @@ def _evaluate_pair(args):
             file_type = "excel"
 
         if mode == "Table parser (no AI)":
-            if file_type == "excel":
-                tables_a = extract_excel_tables(bytes_a, name_a)
-                del bytes_a
-                tables_b = extract_excel_tables(bytes_b, name_b)
-                del bytes_b
-            else:
-                tables_a = extract_as_tables(bytes_a)
-                del bytes_a
-                tables_b = extract_as_tables(bytes_b)
-                del bytes_b
+            extractor = _excel_extractor if file_type == "excel" else _pdf_extractor
+            tables_a = extractor.extract_as_tables(bytes_a, name_a)
+            del bytes_a
+            tables_b = extractor.extract_as_tables(bytes_b, name_b)
+            del bytes_b
 
             if not tables_a or not tables_b:
                 return i, name_a, name_b, None, 0, "Could not extract tables from one or both documents."
@@ -326,12 +321,15 @@ if run_manual or run_bulk:
     total_start = time.perf_counter()
     outcomes = [None] * n_pairs
 
-    with st.spinner(f"Evaluating {n_pairs} pair(s) in parallel…"):
+    with st.status(f"Evaluating {n_pairs} pair(s)…", expanded=False) as _status:
         with ThreadPoolExecutor(max_workers=min(n_pairs, 3)) as executor:
             futures = {executor.submit(_evaluate_pair, args): args[0] for args in pair_args}
             for future in as_completed(futures):
                 i, name_a, name_b, result, elapsed, error = future.result()
                 outcomes[i] = (name_a, name_b, result, elapsed, error)
+                done = sum(o is not None for o in outcomes)
+                _status.update(label=f"Evaluating {n_pairs} pair(s)… ({done}/{n_pairs} done)")
+        _status.update(label=f"Evaluated {n_pairs} pair(s)", state="complete", expanded=False)
 
     total_elapsed = time.perf_counter() - total_start
 

@@ -141,11 +141,28 @@ class TableParser:
         n_cols = max(len(r) for r in rows)
         rows = [r + [''] * (n_cols - len(r)) for r in rows]  # pad to uniform width
 
+        # Trim trailing columns that are entirely empty across all rows.
+        # Merged cells in Excel inflate column count (e.g. a 2-col key-value sheet
+        # appears as 14 columns because merged value cells span cols 2-13).
+        while n_cols > 1 and all(not r[n_cols - 1].strip() for r in rows):
+            n_cols -= 1
+            rows = [r[:n_cols] for r in rows]
+
         if n_cols == 2 and _looks_like_key_value(rows):
             return _parse_key_value(rows, title, subtitle)
 
-        has_header = _is_header_row(rows[0])
-        if has_header:
+        # Scan forward (bounded) to find the first valid header row, skipping blank
+        # and sparse preamble rows (e.g. quarter-label rows like "1Q26" in flowchart
+        # reports that appear before the real column-header row).
+        _LOOKAHEAD = 10
+        header_row_idx = None
+        for _i in range(min(_LOOKAHEAD, len(rows))):
+            if _is_header_row(rows[_i]):
+                header_row_idx = _i
+                break
+
+        if header_row_idx is not None:
+            rows = rows[header_row_idx:]  # discard preamble rows
             header = [c.strip() for c in rows[0]]
             rows = rows[1:]
             if not header[0]:  # first cell empty → matrix

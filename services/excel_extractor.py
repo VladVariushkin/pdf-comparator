@@ -33,15 +33,72 @@ def extract_as_tables(excel_bytes: bytes, filename: str = "") -> list[dict]:
         return _extract_xlsx(excel_bytes)
 
 
+def _fix_xlsx_stylesheet(excel_bytes: bytes) -> bytes | None:
+    """Patch invalid aRGB color values in xl/styles.xml so openpyxl can load the file.
+
+    Returns patched bytes if any fixes were applied, or None if no bad colors
+    were found (so the caller can skip an unnecessary retry).
+
+    Some tools write 6-char (RGB) or truncated hex colors instead of the 8-char
+    aRGB format openpyxl requires.  We normalise them in-place inside the ZIP.
+    """
+    import zipfile
+
+    _STYLES_PATH = "xl/styles.xml"
+    # Match rgb="..." attributes that are NOT exactly 8 hex chars
+    _BAD_COLOR = re.compile(r'(rgb=")([0-9A-Fa-f]{1,7}|[0-9A-Fa-f]{9,})(")')
+
+    def _fix_color(m: re.Match) -> str:
+        val = m.group(2).upper()
+        if len(val) == 6:       # plain RGB without alpha → prepend FF (full opacity)
+            val = "FF" + val
+        elif len(val) < 8:      # truncated → right-pad with F (preserves intent)
+            val = val + "F" * (8 - len(val))
+        else:                   # too long → truncate to 8
+            val = val[:8]
+        return m.group(1) + val + m.group(3)
+
+    buf_in = io.BytesIO(excel_bytes)
+    buf_out = io.BytesIO()
+    fixed_any = False
+    with zipfile.ZipFile(buf_in, "r") as zin, zipfile.ZipFile(buf_out, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            raw = zin.read(item.filename)
+            if item.filename == _STYLES_PATH:
+                text = raw.decode("utf-8", errors="replace")
+                patched_text, n = _BAD_COLOR.subn(_fix_color, text)
+                if n:
+                    fixed_any = True
+                    raw = patched_text.encode("utf-8")
+            zout.writestr(item, raw)
+
+    return buf_out.getvalue() if fixed_any else None
+
+
 def _extract_xlsx(excel_bytes: bytes) -> list[dict]:
     """Extract tables from .xlsx files using openpyxl."""
     import openpyxl
 
+    def _load(data: bytes):
+        return openpyxl.load_workbook(io.BytesIO(data), data_only=False)
+
     try:
-        wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), data_only=False)
-    except Exception as e:
+        wb = _load(excel_bytes)
+    except ValueError as e:
         if "password" in str(e).lower() or "encrypted" in str(e).lower():
             raise ValueError("File is password-protected. Please upload an unprotected version.")
+        # Stylesheet XML issue — attempt in-memory patch and retry once
+        try:
+            patched = _fix_xlsx_stylesheet(excel_bytes)
+        except Exception:
+            patched = None
+        if patched is None:
+            raise ValueError(f"Unable to read Excel file. Please verify it's a valid .xlsx file. Error: {e}")
+        try:
+            wb = _load(patched)
+        except Exception as e2:
+            raise ValueError(f"Unable to read Excel file. Please verify it's a valid .xlsx file. Error: {e2}")
+    except Exception as e:
         raise ValueError(f"Unable to read Excel file. Please verify it's a valid .xlsx file. Error: {e}")
 
     all_tables = []

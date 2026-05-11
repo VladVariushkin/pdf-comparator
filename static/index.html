@@ -149,8 +149,6 @@
         </select>
       </div>
     </div>
-    <input type="hidden" id="mode" value="Table parser (no AI)" />
-
     <div class="tabs">
       <button class="tab-btn active" data-tab="manual">Manual</button>
       <button class="tab-btn" data-tab="bulk">Bulk</button>
@@ -310,7 +308,6 @@
     compareBtn.disabled = true;
 
     const fd = new FormData();
-    fd.append('mode', document.getElementById('mode').value);
     fd.append('file_type_mode', document.getElementById('fileType').value);
 
     if (_activeTab === 'manual') {
@@ -392,7 +389,7 @@
       compareBtn.disabled = false;
 
       // Show report button if any table_parser result exists; keep job alive until clicked
-      const hasTableParser = data.pairs.some(p => p.comparison?.mode === 'table_parser');
+      const hasTableParser = data.pairs.some(p => p.comparison != null);
       if (hasTableParser) {
         reportBtn.dataset.jobId = jobId;
         reportBtn.style.display = 'inline-block';
@@ -475,7 +472,7 @@
     }
 
     // Tables
-    if (cmp.mode === 'table_parser' && cmp.table_order.length) {
+    if (cmp.table_order.length) {
       const missingByTitle = {};
       cmp.missing_tables.forEach(m => missingByTitle[m.title] = m);
 
@@ -519,21 +516,6 @@
         det.appendChild(body);
         frag.appendChild(det);
       });
-    } else {
-      // Non-table-parser mode — flat failure list
-      const failures = cmp.diffs.filter(d => ['mismatch','formula_mismatch','only_in_a','only_in_b'].includes(d.status));
-      const det = document.createElement('details');
-      det.open = true;
-      det.innerHTML = `<summary>Field failures (${failures.length})</summary>`;
-      const body = document.createElement('div');
-      body.className = 'details-body';
-      if (failures.length) {
-        body.appendChild(buildFailureTable(failures, nameA, nameB));
-      } else {
-        body.innerHTML = '<p style="color:#16a34a;padding:8px 0">No field failures.</p>';
-      }
-      det.appendChild(body);
-      frag.appendChild(det);
     }
 
     return frag;

@@ -1,22 +1,11 @@
 import os
 import re
 
+from services.utils import strip_filename_metadata
+
 
 def _doc_identity(name: str) -> str:
-    """Return the canonical document identity key for a filename.
-
-    Strips (in order): directory, extension, Windows copy-number suffix ' (N)',
-    Before/After role label, date segment YYYY-MM-DD, trailing underscores/spaces.
-
-    Examples:
-        "UWS_279295_Flowchart_Report_2026-03-20_Before.pdf"  → "UWS_279295_Flowchart_Report"
-        "UWS_279295_Flowchart_Report__2026-03-23_After (1).pdf" → "UWS_279295_Flowchart_Report"
-    """
-    stem = os.path.splitext(os.path.basename(name))[0]
-    stem = re.sub(r'\s*\(\d+\)\s*$', '', stem)
-    stem = re.sub(r'[_ ]*(Before|After)\s*$', '', stem, flags=re.IGNORECASE)
-    stem = re.sub(r'[_ ]+\d{4}-\d{2}-\d{2}', '', stem)
-    return stem.strip('_ ')
+    return strip_filename_metadata(name)
 
 
 def _doc_role(name: str) -> str | None:

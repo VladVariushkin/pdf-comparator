@@ -1,5 +1,4 @@
 import io
-import os
 import re
 
 import openpyxl
@@ -7,6 +6,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from models.comparison import ComparisonResult
+from services.utils import strip_filename_metadata
 
 _FILLS = {
     "match":            PatternFill("solid", fgColor="FFC6EFCE"),  # Green
@@ -24,16 +24,8 @@ _N_COLS = 4   # Field | Doc A | Doc B | Status
 
 
 def _extract_report_id(name_a: str, name_b: str) -> str:
-    """Return a clean tab name: strip extension, ' (N)' copy suffix, and _Before/_After label.
-    Prefers name_b as the reference document; falls back to name_a."""
-    def _clean(name: str) -> str:
-        stem = os.path.splitext(os.path.basename(name))[0]
-        stem = re.sub(r'\s*\(\d+\)\s*$', '', stem)
-        stem = re.sub(r'[_ ]*(Before|After)\s*$', '', stem, flags=re.IGNORECASE)
-        return stem.rstrip('_ ')
-
     for name in (name_b, name_a):
-        cleaned = _clean(name)
+        cleaned = strip_filename_metadata(name)
         if cleaned:
             return cleaned
     return "Report"

@@ -1,28 +1,30 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 
 class FieldDiffOut(BaseModel):
-    field: str        # e.g. "Revenue Table › Q1 › Net Revenue"
-    table: str        # table title; empty string for non-table modes
-    page: int         # PDF page or Excel sheet index; 0 = unknown
+    field: str
+    table: str
+    page: int
     value_a: str | None
     value_b: str | None
-    status: str       # "match"|"mismatch"|"formula_mismatch"|"only_in_a"|"only_in_b"
+    status: Literal["match", "mismatch", "formula_mismatch", "only_in_a", "only_in_b"]
     formula_a: str | None = None
     formula_b: str | None = None
 
 
 class MissingTableOut(BaseModel):
     title: str
-    missing_from: str     # "A" or "B"
+    missing_from: Literal["A", "B"]
     page: int | None = None
 
 
 class WarningOut(BaseModel):
-    document: str     # "A" or "B"
-    rule: str         # "line_item_total"|"date_ordering"|"duplicate_rows"|"duplicate_columns"
+    document: Literal["A", "B"]
+    rule: str
     detail: str
 
 
@@ -36,7 +38,7 @@ class CountsOut(BaseModel):
 
 
 class ComparisonOut(BaseModel):
-    mode: str                          # "table_parser"|"structured"|"freeform"
+    mode: Literal["table_parser"]
     summary: str
     diffs: list[FieldDiffOut]
     missing_tables: list[MissingTableOut]
@@ -61,7 +63,7 @@ class JobSubmitOut(BaseModel):
 
 class JobStatusOut(BaseModel):
     job_id: str
-    status: str       # "running" | "done"
+    status: Literal["running", "done"]
     done: int
     total: int
     pairs: list[PairResultOut]

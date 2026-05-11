@@ -1,15 +1,16 @@
 import json
-import os
-import threading
-import time
 import uuid
+from collections import Counter
 from dataclasses import asdict
 
+import redis as _redis_lib
 from celery.app.control import Control
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from config import CELERY_QUEUE, JOB_TTL, MAX_QUEUE_DEPTH, MAX_UPLOAD_BYTES, REDIS_URL
+from models.modes import AUTO_DETECT
 from models.api_models import (
     ComparisonOut,
     CountsOut,
@@ -24,76 +25,17 @@ from models.api_models import (
     WarningOut,
 )
 from models.comparison import ComparisonResult, FieldDiff, ValidationWarning
+from services.job_store import RedisJobStore
 from services.pairer import pair_by_name
+from services.report_builder import build_excel_report
 from tasks import celery_app, compare_pair
 
 app = FastAPI(title="Doc Comparator", version="1.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-REDIS_URL = os.getenv("REDIS_URL")
-JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "600"))
-MAX_QUEUE_DEPTH = int(os.getenv("MAX_QUEUE_DEPTH", "20"))
-
-
-# ---------------------------------------------------------------------------
-# Job store — Redis if REDIS_URL is set, otherwise in-memory with TTL cleanup
-# ---------------------------------------------------------------------------
-
-if REDIS_URL:
-    import redis as _redis_lib
-    _redis = _redis_lib.from_url(REDIS_URL, decode_responses=True)
-
-    def _store_set(job_id: str, data: dict) -> None:
-        _redis.setex(f"job:{job_id}", JOB_TTL, json.dumps(data))
-
-    def _store_get(job_id: str) -> dict | None:
-        raw = _redis.get(f"job:{job_id}")
-        return json.loads(raw) if raw else None
-
-    def _store_delete(job_id: str) -> None:
-        _redis.delete(f"job:{job_id}")
-
-    def _store_get_result(job_id: str, idx: int) -> dict | None:
-        raw = _redis.getdel(f"job:{job_id}:r:{idx}")
-        return json.loads(raw) if raw else None
-
-    def _store_count() -> int:
-        return len(_redis.keys("job:*"))
-
-else:
-    _mem_store: dict[str, tuple[dict, float]] = {}
-
-    def _store_set(job_id: str, data: dict) -> None:
-        _mem_store[job_id] = (data, time.time() + JOB_TTL)
-
-    def _store_get(job_id: str) -> dict | None:
-        entry = _mem_store.get(job_id)
-        if not entry:
-            return None
-        data, expires_at = entry
-        if time.time() > expires_at:
-            _mem_store.pop(job_id, None)
-            return None
-        return data
-
-    def _store_delete(job_id: str) -> None:
-        _mem_store.pop(job_id, None)
-
-    def _store_get_result(job_id: str, idx: int) -> dict | None:
-        return None  # Celery requires Redis; not supported in memory-only mode
-
-    def _store_count() -> int:
-        return len(_mem_store)
-
-    def _cleanup_loop() -> None:
-        while True:
-            time.sleep(300)
-            now = time.time()
-            stale = [jid for jid, (_, exp) in list(_mem_store.items()) if now > exp]
-            for jid in stale:
-                _mem_store.pop(jid, None)
-
-    threading.Thread(target=_cleanup_loop, daemon=True).start()
+_redis = _redis_lib.from_url(REDIS_URL, decode_responses=True)
+_redis_bin = _redis_lib.from_url(REDIS_URL, decode_responses=False)
+_store = RedisJobStore(_redis, JOB_TTL)
 
 
 # ---------------------------------------------------------------------------
@@ -101,35 +43,23 @@ else:
 # ---------------------------------------------------------------------------
 
 def _to_comparison_out(result: ComparisonResult) -> ComparisonOut:
-    diffs = [
-        FieldDiffOut(
-            field=d.field, table=d.table, page=d.page,
-            value_a=d.value_a, value_b=d.value_b, status=d.status,
-            formula_a=d.formula_a, formula_b=d.formula_b,
-        )
-        for d in result.diffs
-    ]
-    missing = [
-        MissingTableOut(title=m["title"], missing_from=m["missing_from"], page=m.get("page"))
-        for m in result.missing_tables
-    ]
-    warnings = [
-        WarningOut(document=w.document, rule=w.rule, detail=w.detail)
-        for w in result.warnings
-    ]
-    counts = CountsOut(
-        match=sum(1 for d in result.diffs if d.status == "match"),
-        mismatch=sum(1 for d in result.diffs if d.status == "mismatch"),
-        formula_mismatch=sum(1 for d in result.diffs if d.status == "formula_mismatch"),
-        only_in_a=sum(1 for d in result.diffs if d.status == "only_in_a"),
-        only_in_b=sum(1 for d in result.diffs if d.status == "only_in_b"),
-        missing_tables=len(result.missing_tables),
-    )
+    count = Counter(d.status for d in result.diffs)
     return ComparisonOut(
-        mode=result.mode, summary=result.summary,
-        diffs=diffs, missing_tables=missing,
-        table_order=result.table_order, table_subtitles=result.table_subtitles,
-        warnings=warnings, counts=counts,
+        mode=result.mode,
+        summary=result.summary,
+        diffs=[FieldDiffOut.model_validate(asdict(d)) for d in result.diffs],
+        missing_tables=[MissingTableOut(**m) for m in result.missing_tables],
+        table_order=result.table_order,
+        table_subtitles=result.table_subtitles,
+        warnings=[WarningOut.model_validate(asdict(w)) for w in result.warnings],
+        counts=CountsOut(
+            match=count["match"],
+            mismatch=count["mismatch"],
+            formula_mismatch=count["formula_mismatch"],
+            only_in_a=count["only_in_a"],
+            only_in_b=count["only_in_b"],
+            missing_tables=len(result.missing_tables),
+        ),
     )
 
 
@@ -149,38 +79,39 @@ def _deserialize_result(data: dict | None) -> ComparisonResult | None:
 
 
 # ---------------------------------------------------------------------------
-# Harvest — pull completed Celery task results into the job store
+# Upload helper
 # ---------------------------------------------------------------------------
 
-def _harvest(job_id: str) -> None:
-    data = _store_get(job_id)
-    if not data or data["status"] == "done":
+async def _read_limited(upload: UploadFile) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await upload.read(65536):
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+            raise HTTPException(
+                status_code=413,
+                detail=f"{upload.filename!r} exceeds the {mb} MB upload limit.",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Harvest — mark job done once all result keys are present
+# ---------------------------------------------------------------------------
+
+def _pending_pair(pair_meta: dict) -> PairResultOut:
+    return PairResultOut(name_a=pair_meta["name_a"], name_b=pair_meta["name_b"], elapsed=0.0)
+
+
+def _harvest(job_id: str, data: dict) -> None:
+    if data["status"] == "done":
         return
-
-    updated = False
-    for idx in range(len(data["pairs"])):
-        if data["results"][idx] is not None:
-            continue
-        payload = _store_get_result(job_id, idx)
-        if payload is None:
-            continue
-
-        result = _deserialize_result(payload.get("raw"))
-        pair = data["pairs"][idx]
-        data["results"][idx] = PairResultOut(
-            name_a=pair["name_a"],
-            name_b=pair["name_b"],
-            elapsed=payload["elapsed"],
-            error=payload.get("error"),
-            comparison=_to_comparison_out(result) if result else None,
-        ).model_dump()
-        data["raw_results"][idx] = payload.get("raw")
-        updated = True
-
-    if updated:
-        done = sum(1 for r in data["results"] if r is not None)
-        data["status"] = "done" if done == len(data["results"]) else "running"
-        _store_set(job_id, data)
+    n = len(data["pairs"])
+    if all(_store.get_result(job_id, i) is not None for i in range(n)):
+        data["status"] = "done"
+        _store.set(job_id, data)
 
 
 # ---------------------------------------------------------------------------
@@ -189,11 +120,7 @@ def _harvest(job_id: str) -> None:
 
 @app.get("/health")
 def health() -> dict:
-    return {
-        "status": "ok",
-        "store": "redis" if REDIS_URL else "memory",
-        "jobs": _store_count(),
-    }
+    return {"status": "ok", "jobs": _store.count()}
 
 
 @app.get("/")
@@ -214,37 +141,41 @@ def pair_preview(body: PairPreviewIn) -> PairPreviewOut:
 async def submit_job(
     files_a: list[UploadFile] = File(...),
     files_b: list[UploadFile] = File(...),
-    mode: str = Form("Table parser (no AI)"),
-    file_type_mode: str = Form("Auto-detect"),
+    file_type_mode: str = Form(AUTO_DETECT),
 ) -> JobSubmitOut:
-    if REDIS_URL:
-        depth = _redis.llen("celery")
-        if depth >= MAX_QUEUE_DEPTH:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Server is busy — {depth} tasks already queued. Please wait a moment and try again.",
-            )
+    if len(files_a) != len(files_b):
+        raise HTTPException(
+            status_code=422,
+            detail=f"files_a ({len(files_a)}) and files_b ({len(files_b)}) must have equal counts.",
+        )
 
-    n = min(len(files_a), len(files_b))
+    depth = _redis.llen(CELERY_QUEUE)
+    if depth >= MAX_QUEUE_DEPTH:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Server is busy — {depth} tasks already queued. Please wait a moment and try again.",
+        )
+
+    n = len(files_a)
     job_id = str(uuid.uuid4())
     pairs = []
     task_ids = []
 
     for i in range(n):
-        ba = await files_a[i].read()
-        bb = await files_b[i].read()
+        ba = await _read_limited(files_a[i])
+        bb = await _read_limited(files_b[i])
         na = files_a[i].filename or f"file_a_{i}"
         nb = files_b[i].filename or f"file_b_{i}"
         pairs.append({"name_a": na, "name_b": nb})
-        task = compare_pair.delay(job_id, i, na, ba, nb, bb, mode, file_type_mode)
+        _redis_bin.setex(f"job:{job_id}:f:{i}:a", JOB_TTL, ba)
+        _redis_bin.setex(f"job:{job_id}:f:{i}:b", JOB_TTL, bb)
+        task = compare_pair.delay(job_id, i, na, nb, file_type_mode)
         task_ids.append(task.id)
 
-    _store_set(job_id, {
+    _store.set(job_id, {
         "job_id": job_id,
         "status": "running",
         "pairs": pairs,
-        "results": [None] * n,
-        "raw_results": [None] * n,
         "task_ids": task_ids,
     })
 
@@ -253,26 +184,33 @@ async def submit_job(
 
 @app.get("/jobs/{job_id}", response_model=JobStatusOut)
 def get_job(job_id: str) -> JobStatusOut:
-    _harvest(job_id)
-    data = _store_get(job_id)
+    data = _store.get(job_id)
     if not data:
         raise HTTPException(status_code=404, detail="Job not found")
+    _harvest(job_id, data)
 
-    done = sum(1 for r in data["results"] if r is not None)
-    pairs_out = [
-        PairResultOut.model_validate(r) if r else PairResultOut(
-            name_a=data["pairs"][i]["name_a"],
-            name_b=data["pairs"][i]["name_b"],
-            elapsed=0.0,
-        )
-        for i, r in enumerate(data["results"])
-    ]
+    pairs_out = []
+    done = 0
+    for i, pair_meta in enumerate(data["pairs"]):
+        payload = _store.get_result(job_id, i)
+        if payload is None:
+            pairs_out.append(_pending_pair(pair_meta))
+        else:
+            result = _deserialize_result(payload.get("raw"))
+            pairs_out.append(PairResultOut(
+                name_a=pair_meta["name_a"],
+                name_b=pair_meta["name_b"],
+                elapsed=payload["elapsed"],
+                error=payload.get("error"),
+                comparison=_to_comparison_out(result) if result else None,
+            ))
+            done += 1
 
     return JobStatusOut(
         job_id=job_id,
         status=data["status"],
         done=done,
-        total=len(data["results"]),
+        total=len(data["pairs"]),
         pairs=pairs_out,
     )
 
@@ -280,12 +218,15 @@ def get_job(job_id: str) -> JobStatusOut:
 @app.post("/jobs/{job_id}/cancel", status_code=204)
 @app.delete("/jobs/{job_id}", status_code=204)
 def delete_job(job_id: str) -> None:
-    data = _store_get(job_id)
+    data = _store.get(job_id)
     if data:
         task_ids = data.get("task_ids", [])
         if task_ids:
             Control(celery_app).revoke(task_ids, terminate=True)
-    _store_delete(job_id)
+        for i in range(len(data["pairs"])):
+            _redis_bin.delete(f"job:{job_id}:f:{i}:a", f"job:{job_id}:f:{i}:b")
+            _redis.delete(f"job:{job_id}:r:{i}")
+    _store.delete(job_id)
 
 
 @app.get(
@@ -302,21 +243,23 @@ def delete_job(job_id: str) -> None:
     },
 )
 def get_report(job_id: str) -> Response:
-    from services.report_builder import build_excel_report
-
-    _harvest(job_id)
-    data = _store_get(job_id)
+    data = _store.get(job_id)
     if not data:
         raise HTTPException(status_code=404, detail="Job not found")
+    _harvest(job_id, data)
 
     if data["status"] != "done":
         raise HTTPException(status_code=409, detail="Job not yet complete")
 
-    pairs = [
-        (_deserialize_result(raw), data["pairs"][i]["name_a"], data["pairs"][i]["name_b"])
-        for i, raw in enumerate(data["raw_results"])
-        if raw and raw.get("mode") == "table_parser"
-    ]
+    pairs = []
+    for i, pair_meta in enumerate(data["pairs"]):
+        payload = _store.get_result(job_id, i)
+        if payload and payload.get("raw") and payload["raw"].get("mode") == "table_parser":
+            pairs.append((
+                _deserialize_result(payload["raw"]),
+                pair_meta["name_a"],
+                pair_meta["name_b"],
+            ))
     if not pairs:
         raise HTTPException(
             status_code=422,

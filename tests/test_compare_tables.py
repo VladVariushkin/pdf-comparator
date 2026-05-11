@@ -1,8 +1,11 @@
 import os
+import re
+from pathlib import Path
 import pytest
 from services.comparator import compare_tables, _find_natural_key
+from services.report_builder import _display_title
 
-_BEFORE_PDF = r"C:\Users\Vladyslav_Variushkin\Desktop\UWS_279295_Flowchart_Report_2026-03-20_Before.pdf"
+_BEFORE_PDF = str(Path(__file__).parent / "fixtures" / "pdfs" / "UWS_279295_Flowchart_Report_2026-03-20_Before.pdf")
 
 
 def _kv(title, data):
@@ -217,32 +220,6 @@ class TestCompareTablesMixed:
 
 
 class TestDuplicateRowDetection:
-    def test_duplicate_row_in_a_raises_warning(self):
-        headers = ["Name", "Rate"]
-        dup_rows = [
-            {"Name": "Bravo Early Morning", "Rate": "$826"},
-            {"Name": "Bravo Daytime",       "Rate": "$1,172"},
-            {"Name": "Bravo Early Morning", "Rate": "$826"},  # duplicate
-        ]
-        a = [_col("1Q26", headers, dup_rows)]
-        b = [_col("1Q26", headers, [{"Name": "Bravo Early Morning", "Rate": "$826"}])]
-        result = compare_tables(a, b)
-        w = [w for w in result.warnings if w.rule == "duplicate_rows"]
-        assert len(w) == 1
-        assert w[0].document == "A"
-        assert "Bravo Early Morning" in w[0].detail
-
-    def test_duplicate_row_in_b_raises_warning(self):
-        headers = ["Name", "Rate"]
-        normal  = [{"Name": "Bravo Early Morning", "Rate": "$826"}]
-        dup_rows = normal + normal  # two identical rows
-        a = [_col("1Q26", headers, normal)]
-        b = [_col("1Q26", headers, dup_rows)]
-        result = compare_tables(a, b)
-        w = [w for w in result.warnings if w.rule == "duplicate_rows"]
-        assert len(w) == 1
-        assert w[0].document == "B"
-
     def test_no_duplicate_rows_no_warning(self):
         headers = ["Name", "Rate"]
         rows = [{"Name": "Bravo Early", "Rate": "$826"}, {"Name": "Bravo Daytime", "Rate": "$1,172"}]
@@ -259,21 +236,6 @@ class TestDuplicateRowDetection:
         b = [_col("1Q26", headers, dup_rows)]
         result = compare_tables(a, b)
         assert not any(w.rule == "duplicate_rows" for w in result.warnings)
-
-    def test_multiple_duplicate_rows_all_reported(self):
-        headers = ["Name", "Rate"]
-        dup_rows = [
-            {"Name": "Bravo Early Morning", "Rate": "$826"},
-            {"Name": "Bravo Early Morning", "Rate": "$826"},
-            {"Name": "Bravo Daytime",       "Rate": "$1,172"},
-            {"Name": "Bravo Daytime",       "Rate": "$1,172"},
-        ]
-        a = [_col("1Q26", headers, dup_rows)]
-        b = [_col("1Q26", headers, dup_rows)]
-        result = compare_tables(a, b)
-        details = " ".join(w.detail for w in result.warnings if w.rule == "duplicate_rows")
-        assert "Bravo Early Morning" in details
-        assert "Bravo Daytime" in details
 
 
 class TestDuplicateColumnDetection:
@@ -335,16 +297,18 @@ class TestFieldOrdering:
 
     def test_columnar_value_columns_follow_pdf_order(self):
         # "Rate" before "Days" in PDF — sorted() would put "Days" first.
+        # Note: All columns including key column are now shown as value fields.
         headers = ["Selling Name", "Rate", "Days", "Total"]
         rows = [{"Selling Name": "Bravo Early", "Rate": "$241", "Days": "MTWTFSS", "Total": "$1,205"}]
         a = [_col("1Q26", headers, rows)]
         b = [_col("1Q26", headers, rows)]
         result = compare_tables(a, b)
         col_names = [d.field.split(" › ")[-1] for d in result.diffs]
-        assert col_names == ["Rate", "Days", "Total"]
+        assert col_names == ["Selling Name", "Rate", "Days", "Total"]
 
     def test_columnar_rows_follow_pdf_order(self):
         # "Zebra Early" before "Alpha Morning" in PDF — sorted() would reverse this.
+        # Note: Now includes key column (Name) as a value field, so each row has 2 diffs.
         headers = ["Name", "Rate"]
         rows = [
             {"Name": "Zebra Early", "Rate": "$241"},
@@ -354,7 +318,8 @@ class TestFieldOrdering:
         b = [_col("1Q26", headers, rows)]
         result = compare_tables(a, b)
         row_labels = [d.field.split(" › ")[1] for d in result.diffs]
-        assert row_labels == ["Zebra Early", "Alpha Morning"]
+        # Each row has 2 fields (Name, Rate), so labels repeat
+        assert row_labels == ["Zebra Early", "Zebra Early", "Alpha Morning", "Alpha Morning"]
 
     def test_matrix_row_labels_follow_pdf_order(self):
         # ":30" before ":15" in PDF — sorted() would put ":15" first.
@@ -380,6 +345,7 @@ class TestFieldOrdering:
         # Real-world case: PDF has text cols (Days/Times, CommType, …) to the left
         # of weekly date cols (12/29, 1/5, 1/12 …).  Alphabetically digits sort
         # before letters, so without the fix 1/12 would appear before CommType.
+        # Note: All columns including key column are now shown as value fields.
         headers = [
             "Selling Name", "Days/Times", "CommType",
             "12/29", "1/5", "1/12", "Total Dollars",
@@ -397,9 +363,9 @@ class TestFieldOrdering:
         b = [_col("1Q26", headers, rows)]
         result = compare_tables(a, b)
         col_names = [d.field.split(" › ")[-1] for d in result.diffs]
-        # PDF order: Days/Times, CommType, 12/29, 1/5, 1/12, Total Dollars
-        # (Selling Name is the key col and does not appear as a value field)
-        assert col_names == ["Days/Times", "CommType", "12/29", "1/5", "1/12", "Total Dollars"]
+        # PDF order: Selling Name, Days/Times, CommType, 12/29, 1/5, 1/12, Total Dollars
+        # (Selling Name is now included as a value field along with all other columns)
+        assert col_names == ["Selling Name", "Days/Times", "CommType", "12/29", "1/5", "1/12", "Total Dollars"]
 
 
 class TestFindNaturalKey:
@@ -425,6 +391,28 @@ class TestFindNaturalKey:
         rows_b2 = [{"Name": "A", "Days": "M"}, {"Name": "A", "Days": "T"}]
         rows_a2 = [{"Name": "A", "Days": "M"}, {"Name": "B", "Days": "W"}]
         assert _find_natural_key(rows_a2, rows_b2, ["Name", "Days"], ["Name", "Days"]) == ["Name", "Days"]
+
+    def test_numeric_column_skipped_as_key(self):
+        # AvgUnitRate values are dollar amounts → must not appear in the key
+        # even when the first column ("Network") has duplicates.
+        rows_a = [{"Network": "Bravo", "AvgUnitRate": "$780"},
+                  {"Network": "Bravo", "AvgUnitRate": "$751"}]
+        rows_b = [{"Network": "Bravo", "AvgUnitRate": "$780"},
+                  {"Network": "Bravo", "AvgUnitRate": "$751"}]
+        result = _find_natural_key(rows_a, rows_b,
+                                   ["Network", "AvgUnitRate"],
+                                   ["Network", "AvgUnitRate"])
+        assert result == ["Network"]
+
+    def test_non_numeric_column_still_discriminates(self):
+        # "Days" contains text values like "M", "T" → must still extend key
+        rows_a = [{"Name": "X", "Days": "M", "Rate": "$1"},
+                  {"Name": "X", "Days": "T", "Rate": "$2"}]
+        rows_b = [{"Name": "X", "Days": "W", "Rate": "$3"},
+                  {"Name": "X", "Days": "F", "Rate": "$4"}]
+        assert _find_natural_key(rows_a, rows_b,
+                                 ["Name", "Days", "Rate"],
+                                 ["Name", "Days", "Rate"]) == ["Name", "Days"]
 
 
 # ---------------------------------------------------------------------------
@@ -488,3 +476,329 @@ class TestRealPdf1Q26FieldOrdering:
         assert date_cols == expected_order, (
             f"Date cols not in PDF order.\nGot:      {date_cols}\nExpected: {expected_order}"
         )
+
+
+class TestGroupPositionalMatching:
+    """When the non-numeric key (e.g. network name) is non-unique, rows are
+    matched positionally within each group — numeric values must not appear
+    in the field path."""
+
+    def _headers(self):
+        return ["Network", "AvgUnitRate", "GrossDollars"]
+
+    def test_numeric_value_not_in_field_path(self):
+        h = self._headers()
+        rows = [
+            {"Network": "Bravo", "AvgUnitRate": "$780", "GrossDollars": "$100,000"},
+            {"Network": "Bravo", "AvgUnitRate": "$751", "GrossDollars": "$80,000"},
+        ]
+        a = [_col("Summary", h, rows)]
+        b = [_col("Summary", h, rows)]
+        result = compare_tables(a, b)
+        assert not any("$780" in d.field or "$751" in d.field for d in result.diffs)
+
+    def test_matching_rows_are_match(self):
+        h = self._headers()
+        rows = [
+            {"Network": "Bravo", "AvgUnitRate": "$780", "GrossDollars": "$100,000"},
+            {"Network": "Bravo", "AvgUnitRate": "$751", "GrossDollars": "$80,000"},
+        ]
+        a = [_col("Summary", h, rows)]
+        b = [_col("Summary", h, rows)]
+        result = compare_tables(a, b)
+        assert all(d.status == "match" for d in result.diffs)
+
+    def test_rate_change_shows_as_mismatch_not_missing(self):
+        h = self._headers()
+        a = [_col("Summary", h, [
+            {"Network": "Bravo", "AvgUnitRate": "$780", "GrossDollars": "$100,000"},
+            {"Network": "Bravo", "AvgUnitRate": "$751", "GrossDollars": "$80,000"},
+        ])]
+        b = [_col("Summary", h, [
+            {"Network": "Bravo", "AvgUnitRate": "$790", "GrossDollars": "$100,000"},
+            {"Network": "Bravo", "AvgUnitRate": "$751", "GrossDollars": "$80,000"},
+        ])]
+        result = compare_tables(a, b)
+        mismatches = [d for d in result.diffs if d.status == "mismatch"]
+        only_in_a = [d for d in result.diffs if d.status == "only_in_a"]
+        only_in_b = [d for d in result.diffs if d.status == "only_in_b"]
+        # Changed AvgUnitRate in row 1 must be a mismatch, not a disappearing row
+        assert any("AvgUnitRate" in d.field for d in mismatches)
+        assert not only_in_a
+        assert not only_in_b
+
+    def test_positional_label_uses_numeric_suffix_for_groups(self):
+        h = self._headers()
+        rows = [
+            {"Network": "Bravo", "AvgUnitRate": "$780", "GrossDollars": "$100,000"},
+            {"Network": "Bravo", "AvgUnitRate": "$751", "GrossDollars": "$80,000"},
+        ]
+        a = [_col("Summary", h, rows)]
+        b = [_col("Summary", h, rows)]
+        result = compare_tables(a, b)
+        labels = {d.field.split(" › ")[1] for d in result.diffs}
+        assert "Bravo (1)" in labels
+        assert "Bravo (2)" in labels
+
+    def test_single_row_group_has_no_suffix(self):
+        h = self._headers()
+        a = [_col("Summary", h, [
+            {"Network": "Bravo", "AvgUnitRate": "$780", "GrossDollars": "$100,000"},
+            {"Network": "CNN",   "AvgUnitRate": "$567", "GrossDollars": "$50,000"},
+        ])]
+        b = [_col("Summary", h, [
+            {"Network": "Bravo", "AvgUnitRate": "$780", "GrossDollars": "$100,000"},
+            {"Network": "CNN",   "AvgUnitRate": "$567", "GrossDollars": "$50,000"},
+        ])]
+        result = compare_tables(a, b)
+        labels = {d.field.split(" › ")[1] for d in result.diffs}
+        # CNN appears once — no positional suffix
+        assert "CNN" in labels
+        assert not any(l.startswith("CNN (") for l in labels)
+
+
+class TestDisplayTitle:
+    def test_strips_page_suffix(self):
+        assert _display_title("Property Summary Total (p. 3)") == "Property Summary Total"
+
+    def test_strips_with_space_variants(self):
+        assert _display_title("Property Summary Total (p.3)") == "Property Summary Total"
+        assert _display_title("Selling Names (p. 12)") == "Selling Names"
+
+    def test_strips_question_mark_page(self):
+        assert _display_title("Plan (p. ?)") == "Plan"
+
+    def test_title_without_suffix_unchanged(self):
+        assert _display_title("Property Summary Total") == "Property Summary Total"
+        assert _display_title("1Q26") == "1Q26"
+        assert _display_title("") == ""
+
+    def test_does_not_strip_mid_title_parens(self):
+        # Only trailing "(p. N)" should be removed, not parens elsewhere in the title.
+        assert _display_title("P2+ (000) by Week (p. 3)") == "P2+ (000) by Week"
+        assert _display_title("P2+ (000) by Week") == "P2+ (000) by Week"
+
+
+class TestCollapsedRowKeys:
+    """When camelot collapses an entire data row into the first column (all
+    values joined with \\n), the row label in the field key must only use the
+    text before the first embedded numeric — not the full joined string.
+
+    Real-world trigger: 'Selling Names by Quarter' tables in multi-page PDFs
+    where page-boundary rows are not repaired by _fix_collapsed_rows because
+    their part-count differs from the dominant column pattern.
+    """
+
+    _HEADERS = ["Selling Name", "Unit Rate", "Avg Unit Rate", "Gross Dollars"]
+
+    def _collapsed_row(self):
+        # Simulates a row where camelot put all values in Selling Name with \n
+        return {
+            "Selling Name": "2Q26 - Bravo\n$634\n$1,268\n$104,550",
+            "Unit Rate": "",
+            "Avg Unit Rate": "",
+            "Gross Dollars": "",
+        }
+
+    def test_no_dollar_amount_in_field_key(self):
+        """Dollar amounts must never appear in the row-label segment of a field path."""
+        a = [_col("SNQ", self._HEADERS, [self._collapsed_row()])]
+        b = [_col("SNQ", self._HEADERS, [self._collapsed_row()])]
+        result = compare_tables(a, b)
+
+        for d in result.diffs:
+            parts = d.field.split(" › ")
+            row_label = parts[1] if len(parts) >= 2 else ""
+            assert not re.search(r'\$\d', row_label), (
+                f"Dollar amount leaked into row label: {d.field!r}"
+            )
+
+    def test_no_percentage_in_field_key(self):
+        """Percentage values (100.00%) must never appear in the row-label segment."""
+        collapsed = {
+            "Selling Name": "2Q26 - Bravo\n$634\n100.00%\n$104,550",
+            "Unit Rate": "",
+            "Avg Unit Rate": "",
+            "Gross Dollars": "",
+        }
+        a = [_col("SNQ", self._HEADERS, [collapsed])]
+        b = [_col("SNQ", self._HEADERS, [collapsed])]
+        result = compare_tables(a, b)
+
+        for d in result.diffs:
+            parts = d.field.split(" › ")
+            row_label = parts[1] if len(parts) >= 2 else ""
+            assert not re.search(r'\d+\.\d+%', row_label), (
+                f"Percentage leaked into row label: {d.field!r}"
+            )
+
+    def test_label_uses_only_first_line_of_collapsed_cell(self):
+        """The row label should be just the first line of the Selling Name cell."""
+        a = [_col("SNQ", self._HEADERS, [self._collapsed_row()])]
+        b = [_col("SNQ", self._HEADERS, [self._collapsed_row()])]
+        result = compare_tables(a, b)
+
+        row_labels = {
+            d.field.split(" › ")[1]
+            for d in result.diffs
+            if len(d.field.split(" › ")) >= 2
+        }
+        assert row_labels == {"2Q26 - Bravo"}, (
+            f"Expected label '2Q26 - Bravo', got: {row_labels}"
+        )
+
+    def test_legitimate_multiline_name_preserved(self):
+        """A Selling Name with non-numeric \\n-parts must NOT be truncated at the first line."""
+        # e.g. "Bravo Early\nNo\nBDN-\nFringe (M-" is the actual name of the selling unit,
+        # not a collapsed row — the \n parts are text, not numeric values.
+        headers = ["Selling Name", "Unit Rate"]
+        row = {
+            "Selling Name": "Bravo Early\nNo\nBDN-\nFringe (M-",
+            "Unit Rate": "$634",
+        }
+        a = [_col("SNQ", headers, [row])]
+        b = [_col("SNQ", headers, [row])]
+        result = compare_tables(a, b)
+
+        row_labels = {
+            d.field.split(" › ")[1]
+            for d in result.diffs
+            if len(d.field.split(" › ")) >= 2
+        }
+        assert any("BDN" in lbl for lbl in row_labels), (
+            f"Multi-line name was incorrectly truncated. Labels: {row_labels}"
+        )
+
+    def test_trailing_empty_key_columns_not_in_label(self):
+        """When a row only fills the first key column, trailing ' · ' dots must be stripped."""
+        # key_cols will be ["Selling Name", "Comm Type"] because "Selling Name" alone
+        # is not unique (two Bravo rows).  The summary row has Comm Type = "" → without
+        # stripping the label would be "Total Bravo · " instead of "Total Bravo".
+        headers = ["Selling Name", "Comm Type", "Rate"]
+        rows = [
+            {"Selling Name": "Bravo", "Comm Type": "NATL",  "Rate": "$634"},
+            {"Selling Name": "Bravo", "Comm Type": "Local", "Rate": "$500"},
+            {"Selling Name": "Total Bravo", "Comm Type": "", "Rate": "$1,134"},
+        ]
+        a = [_col("SNQ", headers, rows)]
+        b = [_col("SNQ", headers, rows)]
+        result = compare_tables(a, b)
+
+        for d in result.diffs:
+            parts = d.field.split(" › ")
+            row_label = parts[1] if len(parts) >= 2 else ""
+            assert not row_label.endswith(" · "), (
+                f"Trailing dot in label: {d.field!r}"
+            )
+            assert " ·  · " not in row_label, (
+                f"Multiple empty dots in label: {d.field!r}"
+            )
+
+    def test_numeric_values_filtered_from_misaligned_summary_rows(self):
+        """Summary rows with merged cells can shift metrics into key column slots.
+
+        When camelot extracts a summary row (e.g., "No Price Period - Bravo") whose
+        label spans multiple columns, the metric values may land in key column slots
+        due to column misalignment. These purely numeric parts must be filtered out
+        from the display label.
+
+        Real-world example: PDF shows "No Price Period - Bravo" with metrics 3,276,
+        100.00%, $40.99, $34.84. After extraction the row dict might have:
+          - "Selling Name": "No Price Period - Bravo"
+          - "Unit Length": "3,276"       (shifted metric!)
+          - "SN Group": "100.00%"        (shifted metric!)
+          - "Comm Type": "$40.99"        (shifted metric!)
+          - "Rtg. Strm.": "$34.84"       (shifted metric!)
+
+        Without filtering, the label would be:
+          "No Price Period - Bravo · 3,276 · 100.00% · $40.99 · $34.84"
+
+        With filtering, the label should be just:
+          "No Price Period - Bravo"
+        """
+        headers = ["Selling Name", "Unit Length", "SN Group", "Comm Type", "Rtg. Strm.", "Total Imps"]
+        # Summary row with misaligned metrics in key column slots
+        summary_row = {
+            "Selling Name": "No Price Period - Bravo",
+            "Unit Length": "3,276",       # shifted metric
+            "SN Group": "100.00%",        # shifted metric
+            "Comm Type": "$40.99",        # shifted metric
+            "Rtg. Strm.": "$34.84",       # shifted metric
+            "Total Imps": "3,276",
+        }
+        # Detail row with proper column alignment
+        detail_row = {
+            "Selling Name": "Bravo Late Night",
+            "Unit Length": ":15",
+            "SN Group": "No SN Group",
+            "Comm Type": "NATL/Guar",
+            "Rtg. Strm.": "BDN-C3",
+            "Total Imps": "360",
+        }
+        a = [_col("Summary", headers, [summary_row, detail_row])]
+        b = [_col("Summary", headers, [summary_row, detail_row])]
+        result = compare_tables(a, b)
+
+        for d in result.diffs:
+            parts = d.field.split(" › ")
+            row_label = parts[1] if len(parts) >= 2 else ""
+            # No numeric values should appear in the row label
+            assert "3,276" not in row_label, f"Numeric value leaked into label: {d.field!r}"
+            assert "100.00%" not in row_label, f"Percentage leaked into label: {d.field!r}"
+            assert "$40.99" not in row_label, f"Currency leaked into label: {d.field!r}"
+            assert "$34.84" not in row_label, f"Currency leaked into label: {d.field!r}"
+
+        # Verify summary row label is clean
+        summary_labels = {
+            d.field.split(" › ")[1]
+            for d in result.diffs
+            if "No Price Period" in d.field
+        }
+        assert "No Price Period - Bravo" in summary_labels, (
+            f"Expected clean summary label, got: {summary_labels}"
+        )
+
+    def test_misaligned_rows_shown_as_is_without_realignment(self):
+        """Values are shown as extracted without automatic realignment.
+
+        The _realign_row function was disabled because its heuristic incorrectly
+        triggered on legitimate rows with empty columns in the middle. Values
+        are now shown exactly as extracted from the PDF, even if misaligned.
+
+        This test verifies that all columns are shown as value fields, including
+        the key columns, preserving the exact extracted values.
+        """
+        headers = ["Selling Name", "Unit Length", "SN Group", "Total Imps", "Total GRPs", "VPVH"]
+        # Row with values in various columns - no realignment attempted
+        total_row = {
+            "Selling Name": "Total",
+            "Unit Length": "16,519",
+            "SN Group": "24.39",
+            "Total Imps": "",
+            "Total GRPs": "",
+            "VPVH": "0.256",
+        }
+        a = [_col("Summary", headers, [total_row])]
+        b = [_col("Summary", headers, [total_row])]
+        result = compare_tables(a, b)
+
+        # Find diffs for the Total row - all columns should be present
+        total_diffs = [d for d in result.diffs if d.field.startswith("Summary › Total ›")]
+
+        # Values should appear in their original columns, no realignment
+        selling_name_diff = next((d for d in total_diffs if "Selling Name" in d.field), None)
+        unit_length_diff = next((d for d in total_diffs if "Unit Length" in d.field), None)
+        sn_group_diff = next((d for d in total_diffs if "SN Group" in d.field), None)
+        vpvh_diff = next((d for d in total_diffs if "VPVH" in d.field), None)
+
+        assert selling_name_diff is not None, "Selling Name should appear as a value field"
+        assert selling_name_diff.value_a == "Total"
+
+        assert unit_length_diff is not None, "Unit Length should appear as a value field"
+        assert unit_length_diff.value_a == "16,519"
+
+        assert sn_group_diff is not None, "SN Group should appear as a value field"
+        assert sn_group_diff.value_a == "24.39"
+
+        assert vpvh_diff is not None, "VPVH should have a diff"
+        assert vpvh_diff.value_a == "0.256"

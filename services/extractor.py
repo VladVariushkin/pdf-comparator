@@ -8,16 +8,6 @@ from services.utils import is_numeric_value
 _camelot_sem = threading.Semaphore(int(os.getenv("CAMELOT_CONCURRENCY", "1")))
 
 
-def extract_as_text(pdf_bytes: bytes) -> list[str]:
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-    try:
-        return _extract(tmp_path)
-    finally:
-        os.unlink(tmp_path)
-
-
 def extract_as_tables(pdf_bytes: bytes, filename: str = "") -> list[dict]:
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(pdf_bytes)
